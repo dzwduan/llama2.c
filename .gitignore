@@ -1,0 +1,13 @@
+.vscode 
+.cache 
+
+compile_commands.json
+
+run
+runq
+
+*.bin
+
+# Vortex running files
+trace
+*.log

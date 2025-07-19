@@ -7,12 +7,44 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #if defined _WIN32
     #include "win.h"
 #else
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+
+#include "vortex.h"
+
+// ----------------------------------------------------------------------------
+// Vortex
+#define RT_CHECK(_expr)                                                        \
+  do {                                                                         \
+    int _ret = _expr;                                                          \
+    if (0 == _ret)                                                             \
+      break;                                                                   \
+    printf("Error: '%s' returned %d!\n", #_expr, (int)_ret);                   \
+    cleanup();                                                                 \
+    exit(-1);                                                                  \
+  } while (false)
+
+static vx_device_h device = NULL;
+
+static void cleanup() {
+  if (device) {
+    RT_CHECK(vx_dev_close(device));
+    device = NULL;
+  }
+}
+
+__attribute__((constructor)) static void vortex_module_ctor() {
+  // Open Vortex device connection
+  RT_CHECK(vx_dev_open(&device));
+}
+
+__attribute__((destructor)) static void vortex_module_dtor() { cleanup(); }
+
 // ----------------------------------------------------------------------------
 // Transformer model
 

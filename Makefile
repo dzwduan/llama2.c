@@ -2,6 +2,17 @@
 # example override to clang: make run CC=clang
 CC = gcc
 
+# Vortex Support
+VORTEX_HOME ?= $(abspath ../vortex)
+VORTEX_BUILD_DIR ?= $(VORTEX_HOME)/build
+VORTEX_RT_PATH ?= $(VORTEX_BUILD_DIR)/runtime
+
+VORTEX_CXXFLAGS = -I$(VORTEX_HOME)/runtime/include -I$(VORTEX_BUILD_DIR)/hw
+VORTEX_LDFLAGS = -L$(VORTEX_RT_PATH) -lvortex
+
+CFLAGS += $(VORTEX_CXXFLAGS)
+LDFLAGS += $(VORTEX_LDFLAGS)
+
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
 run: run.c
@@ -11,8 +22,8 @@ run: run.c
 # useful for a debug build, can then e.g. analyze with valgrind, example:
 # $ valgrind --leak-check=full ./run out/model.bin -n 3
 rundebug: run.c
-	$(CC) -g -o run run.c -lm
-	$(CC) -g -o runq runq.c -lm
+	$(CC) -g -O2 -o run run.c -lm $(CFLAGS) $(LDFLAGS)
+	$(CC) -g -O2 -o runq runq.c -lm $(CFLAGS) $(LDFLAGS)
 
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 # https://simonbyrne.github.io/notes/fastmath/
@@ -74,3 +85,9 @@ testcc:
 clean:
 	rm -f run
 	rm -f runq
+
+.PHONY: run-vortex
+run-vortex: rundebug
+	@echo "\033[1;32m====== RUNNING =======\033[0m"
+	@LD_LIBRARY_PATH=$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=simx ./run stories15M.bin -n 32 -i "HelloWorld!" -s 256
+	@echo "\033[1;32m====== FINISHED ======\033[0m"
