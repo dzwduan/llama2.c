@@ -16,6 +16,7 @@
 #endif
 
 #include "vortex.h"
+#include "kernels/kernels.h"
 
 // ----------------------------------------------------------------------------
 // Vortex
@@ -38,9 +39,15 @@ static void cleanup() {
   }
 }
 
+static const char *vx_gemv_kernel = "./kernels/build/gemv.vxbin";
+static vx_buffer_h vx_gemv_buf = NULL;
+
 __attribute__((constructor)) static void vortex_module_ctor() {
   // Open Vortex device connection
   RT_CHECK(vx_dev_open(&device));
+
+  // Upload kernels
+  RT_CHECK(vx_upload_kernel_file(device, vx_gemv_kernel, &vx_gemv_buf));
 }
 
 __attribute__((destructor)) static void vortex_module_dtor() { cleanup(); }
@@ -258,6 +265,55 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
         }
         xout[i] = val;
     }
+}
+
+void matmul_vx(float *xout, float *x, float *w, int n, int d) {
+  vx_buffer_h xout_buf = NULL;
+  vx_buffer_h x_buf = NULL;
+  vx_buffer_h w_buf = NULL;
+  gemv_arg_t args = {};
+
+  // Allocate buffers
+  // xout (d,) size: d * sizeof(float)
+  size_t xout_size = d * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, xout_size, VX_MEM_WRITE, &xout_buf));
+  RT_CHECK(vx_mem_address(xout_buf, &args.xout_addr));
+
+  // x (n,) size: n * sizeof(float)
+  size_t x_size = n * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, x_size, VX_MEM_READ, &x_buf));
+  RT_CHECK(vx_mem_address(x_buf, &args.x_addr));
+
+  // w (d,n) size: d * n * sizeof(float)
+  size_t w_size = d * n * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, w_size, VX_MEM_READ, &w_buf));
+  RT_CHECK(vx_mem_address(w_buf, &args.w_addr));
+
+  // Upload x to device
+  RT_CHECK(vx_copy_to_dev(x_buf, x, 0, x_size));
+  // Upload w to device
+  RT_CHECK(vx_copy_to_dev(w_buf, w, 0, w_size));
+
+  // Upload kernel arguments
+  args.n = n;
+  args.d = d;
+
+  vx_buffer_h gemv_args_buffer;
+  RT_CHECK(
+      vx_upload_bytes(device, &args, sizeof(gemv_arg_t), &gemv_args_buffer));
+
+  // Start the kernel
+  RT_CHECK(vx_start(device, vx_gemv_buf, gemv_args_buffer));
+  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+
+  // Download the output
+  RT_CHECK(vx_copy_from_dev(xout, xout_buf, 0, xout_size));
+
+  // Free the buffers
+  RT_CHECK(vx_mem_free(xout_buf));
+  RT_CHECK(vx_mem_free(x_buf));
+  RT_CHECK(vx_mem_free(w_buf));
+  RT_CHECK(vx_mem_free(gemv_args_buffer));
 }
 
 float* forward(Transformer* transformer, int token, int pos) {

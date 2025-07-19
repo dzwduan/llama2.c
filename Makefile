@@ -6,6 +6,7 @@ CC = gcc
 VORTEX_HOME ?= $(abspath ../vortex)
 VORTEX_BUILD_DIR ?= $(VORTEX_HOME)/build
 VORTEX_RT_PATH ?= $(VORTEX_BUILD_DIR)/runtime
+VORTEX_KN_PATH ?= $(VORTEX_BUILD_DIR)/kernel
 
 VORTEX_CXXFLAGS = -I$(VORTEX_HOME)/runtime/include -I$(VORTEX_BUILD_DIR)/hw
 VORTEX_LDFLAGS = -L$(VORTEX_RT_PATH) -lvortex
@@ -86,8 +87,15 @@ clean:
 	rm -f run
 	rm -f runq
 
+
+.PHONY: build_kernels
+build_kernels:
+	@echo "\033[1;32m====== BUILDING KERNELS =======\033[0m"
+	@$(MAKE) -C kernels VORTEX_KN_PATH=$(VORTEX_KN_PATH) VORTEX_HOME=$(VORTEX_HOME) VORTEX_BUILD_DIR=$(VORTEX_BUILD_DIR)
+	@echo "\033[1;32m====== KERNELS BUILT =======\033[0m"
+
 .PHONY: run-vortex
-run-vortex: rundebug
+run-vortex: rundebug build_kernels
 	@echo "\033[1;32m====== RUNNING =======\033[0m"
 	@LD_LIBRARY_PATH=$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=simx ./run stories15M.bin -n 32 -i "HelloWorld!" -s 256
 	@echo "\033[1;32m====== FINISHED ======\033[0m"
