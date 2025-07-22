@@ -42,12 +42,16 @@ static void cleanup() {
 static const char *vx_gemv_kernel = "./kernels/build/gemv.vxbin";
 static vx_buffer_h vx_gemv_buf = NULL;
 
+static const char *vx_rmsnorm_kernel = "./kernels/build/rmsnorm.vxbin";
+static vx_buffer_h vx_rmsnorm_buf = NULL;
+
 __attribute__((constructor)) static void vortex_module_ctor() {
   // Open Vortex device connection
   RT_CHECK(vx_dev_open(&device));
 
   // Upload kernels
-  RT_CHECK(vx_upload_kernel_file(device, vx_gemv_kernel, &vx_gemv_buf));
+  // RT_CHECK(vx_upload_kernel_file(device, vx_gemv_kernel, &vx_gemv_buf));
+  RT_CHECK(vx_upload_kernel_file(device, vx_rmsnorm_kernel, &vx_rmsnorm_buf));
 }
 
 __attribute__((destructor)) static void vortex_module_dtor() { cleanup(); }
@@ -231,6 +235,76 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     for (int j = 0; j < size; j++) {
         o[j] = weight[j] * (ss * x[j]);
     }
+}
+
+int divUp(int a, int b) { return (a - 1) / b + 1; }
+
+void rmsnorm_vx(float *o, float *x, float *weight, int size) {
+  vx_buffer_h o_buf = NULL;
+  vx_buffer_h x_buf = NULL;
+  vx_buffer_h w_buf = NULL;
+  vx_buffer_h global_ss_buf = NULL;
+  vx_buffer_h global_sums_buf = NULL;
+  rmsnorm_arg_t args = {};
+
+  uint64_t num_cores, num_warps, num_threads;
+  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_CORES, &num_cores));
+  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_WARPS, &num_warps));
+  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &num_threads));
+
+  // Allocate buffers
+  // o (size,) size: size * sizeof(float)
+  size_t o_size = size * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, o_size, VX_MEM_READ_WRITE, &o_buf));
+  RT_CHECK(vx_mem_address(o_buf, &args.o_addr));
+
+  // x (size,) size: size * sizeof(float)
+  size_t x_size = size * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, x_size, VX_MEM_READ, &x_buf));
+  RT_CHECK(vx_mem_address(x_buf, &args.x_addr));
+
+  // weight (size,) size: size * sizeof(float)
+  size_t w_size = size * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, w_size, VX_MEM_READ, &w_buf));
+  RT_CHECK(vx_mem_address(w_buf, &args.w_addr));
+
+  // Allocate global buffers for vortex kernel
+  RT_CHECK(
+      vx_mem_alloc(device, sizeof(float), VX_MEM_READ_WRITE, &global_ss_buf));
+  RT_CHECK(vx_mem_address(global_ss_buf, &args.global_ss_addr));
+
+  // Allocate global sums buffer
+  RT_CHECK(vx_mem_alloc(device, sizeof(float) * num_cores, VX_MEM_READ_WRITE,
+                        &global_sums_buf));
+  RT_CHECK(vx_mem_address(global_sums_buf, &args.global_sums_addr));
+
+  // Upload x to device
+  RT_CHECK(vx_copy_to_dev(x_buf, x, 0, x_size));
+  // Upload weight to device
+  RT_CHECK(vx_copy_to_dev(w_buf, weight, 0, w_size));
+
+  // Upload kernel arguments
+  args.size = size;
+
+  int total_threads = num_cores * num_warps * num_threads;
+  args.elements_per_thread = divUp(size, total_threads);
+
+  vx_buffer_h rmsnorm_args_buffer;
+  RT_CHECK(vx_upload_bytes(device, &args, sizeof(rmsnorm_arg_t),
+                           &rmsnorm_args_buffer));
+
+  // Start the kernel
+  RT_CHECK(vx_start(device, vx_rmsnorm_buf, rmsnorm_args_buffer));
+  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+
+  // Download the output
+  RT_CHECK(vx_copy_from_dev(o, o_buf, 0, o_size));
+
+  // Free the buffers
+  RT_CHECK(vx_mem_free(o_buf));
+  RT_CHECK(vx_mem_free(x_buf));
+  RT_CHECK(vx_mem_free(w_buf));
+  RT_CHECK(vx_mem_free(rmsnorm_args_buffer));
 }
 
 void softmax(float* x, int size) {
