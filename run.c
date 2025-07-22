@@ -48,10 +48,6 @@ static vx_buffer_h vx_rmsnorm_buf = NULL;
 __attribute__((constructor)) static void vortex_module_ctor() {
   // Open Vortex device connection
   RT_CHECK(vx_dev_open(&device));
-
-  // Upload kernels
-  // RT_CHECK(vx_upload_kernel_file(device, vx_gemv_kernel, &vx_gemv_buf));
-  RT_CHECK(vx_upload_kernel_file(device, vx_rmsnorm_kernel, &vx_rmsnorm_buf));
 }
 
 __attribute__((destructor)) static void vortex_module_dtor() { cleanup(); }
@@ -293,6 +289,9 @@ void rmsnorm_vx(float *o, float *x, float *weight, int size) {
   RT_CHECK(vx_upload_bytes(device, &args, sizeof(rmsnorm_arg_t),
                            &rmsnorm_args_buffer));
 
+  // Upload kernel
+  RT_CHECK(vx_upload_kernel_file(device, vx_rmsnorm_kernel, &vx_rmsnorm_buf));
+
   // Start the kernel
   RT_CHECK(vx_start(device, vx_rmsnorm_buf, rmsnorm_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
@@ -305,6 +304,7 @@ void rmsnorm_vx(float *o, float *x, float *weight, int size) {
   RT_CHECK(vx_mem_free(x_buf));
   RT_CHECK(vx_mem_free(w_buf));
   RT_CHECK(vx_mem_free(rmsnorm_args_buffer));
+  RT_CHECK(vx_mem_free(vx_rmsnorm_buf));
 }
 
 void softmax(float* x, int size) {
@@ -376,6 +376,9 @@ void matmul_vx(float *xout, float *x, float *w, int n, int d) {
   RT_CHECK(
       vx_upload_bytes(device, &args, sizeof(gemv_arg_t), &gemv_args_buffer));
 
+  // Upload kernel
+  RT_CHECK(vx_upload_kernel_file(device, vx_gemv_kernel, &vx_gemv_buf));
+
   // Start the kernel
   RT_CHECK(vx_start(device, vx_gemv_buf, gemv_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
@@ -388,6 +391,7 @@ void matmul_vx(float *xout, float *x, float *w, int n, int d) {
   RT_CHECK(vx_mem_free(x_buf));
   RT_CHECK(vx_mem_free(w_buf));
   RT_CHECK(vx_mem_free(gemv_args_buffer));
+  RT_CHECK(vx_mem_free(vx_gemv_buf));
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
