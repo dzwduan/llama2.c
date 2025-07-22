@@ -394,6 +394,25 @@ void matmul_vx(float *xout, float *x, float *w, int n, int d) {
   RT_CHECK(vx_mem_free(vx_gemv_buf));
 }
 
+void rope_encoding(int dim, int kv_dim, int head_size, float pos, float *q,
+                   float *k) {
+  for (int i = 0; i < dim; i += 2) {
+    int head_dim = i % head_size;
+    float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+    float val = pos * freq;
+    float fcr = cosf(val);
+    float fci = sinf(val);
+    int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+    for (int v = 0; v < rotn; v++) {
+      float *vec = v == 0 ? q : k; // the vector to rotate (query or key)
+      float v0 = vec[i];
+      float v1 = vec[i + 1];
+      vec[i] = v0 * fcr - v1 * fci;
+      vec[i + 1] = v0 * fci + v1 * fcr;
+    }
+  }
+}
+
 float* forward(Transformer* transformer, int token, int pos) {
 
     // a few convenience variables
@@ -428,21 +447,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
-        for (int i = 0; i < dim; i+=2) {
-            int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
-            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-            for (int v = 0; v < rotn; v++) {
-                float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
-                float v0 = vec[i];
-                float v1 = vec[i+1];
-                vec[i]   = v0 * fcr - v1 * fci;
-                vec[i+1] = v0 * fci + v1 * fcr;
-            }
-        }
+        rope_encoding(dim, kv_dim, head_size, pos, s->q, s->k);
 
         // multihead attention. iterate over all heads
         int h;
