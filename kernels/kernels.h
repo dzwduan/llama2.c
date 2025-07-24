@@ -44,3 +44,9 @@ typedef struct {
   uint64_t b_addr;
   uint32_t size;
 } accum_arg_t;
+
+typedef struct {
+  uint64_t hb_addr;
+  uint64_t hb2_addr;
+  uint32_t hidden_dim;
+} swiglu_arg_t;

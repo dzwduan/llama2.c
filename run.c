@@ -54,6 +54,9 @@ static vx_buffer_h vx_softmax_buf = NULL;
 static const char *vx_accum_kernel = "./kernels/build/accum.vxbin";
 static vx_buffer_h vx_accum_buf = NULL;
 
+static const char *vx_swiglu_kernel = "./kernels/build/swiglu.vxbin";
+static vx_buffer_h vx_swiglu_buf = NULL;
+
 __attribute__((constructor)) static void vortex_module_ctor() {
   // Open Vortex device connection
   RT_CHECK(vx_dev_open(&device));
@@ -633,6 +636,51 @@ void swiglu(float *hb, float *hb2, int hidden_dim) {
     val *= hb2[i];
     hb[i] = val;
   }
+}
+
+void swiglu_vx(float *hb, float *hb2, int hidden_dim) {
+  vx_buffer_h hb_buf = NULL;
+  vx_buffer_h hb2_buf = NULL;
+  swiglu_arg_t args = {};
+
+  // Allocate buffers
+  // hb (hidden_dim,) size: hidden_dim * sizeof(float)
+  size_t hb_size = hidden_dim * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, hb_size, VX_MEM_READ_WRITE, &hb_buf));
+  RT_CHECK(vx_mem_address(hb_buf, &args.hb_addr));
+
+  // hb2 (hidden_dim,) size: hidden_dim * sizeof(float)
+  size_t hb2_size = hidden_dim * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, hb2_size, VX_MEM_READ_WRITE, &hb2_buf));
+  RT_CHECK(vx_mem_address(hb2_buf, &args.hb2_addr));
+
+  // Upload hb to device
+  RT_CHECK(vx_copy_to_dev(hb_buf, hb, 0, hb_size));
+  // Upload hb2 to device
+  RT_CHECK(vx_copy_to_dev(hb2_buf, hb2, 0, hb2_size));
+
+  // Upload kernel arguments
+  args.hidden_dim = hidden_dim;
+
+  vx_buffer_h swiglu_args_buffer;
+  RT_CHECK(vx_upload_bytes(device, &args, sizeof(swiglu_arg_t),
+                           &swiglu_args_buffer));
+
+  // Upload kernel
+  RT_CHECK(vx_upload_kernel_file(device, vx_swiglu_kernel, &vx_swiglu_buf));
+
+  // Start the kernel
+  RT_CHECK(vx_start(device, vx_swiglu_buf, swiglu_args_buffer));
+  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+
+  // Download the output
+  RT_CHECK(vx_copy_from_dev(hb, hb_buf, 0, hb_size));
+
+  // Free the buffers
+  RT_CHECK(vx_mem_free(hb_buf));
+  RT_CHECK(vx_mem_free(hb2_buf));
+  RT_CHECK(vx_mem_free(swiglu_args_buffer));
+  RT_CHECK(vx_mem_free(vx_swiglu_buf));
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
