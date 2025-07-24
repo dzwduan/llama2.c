@@ -525,46 +525,45 @@ void rope_encoding_vx(int dim, int kv_dim, int head_size, float pos, float *q,
   RT_CHECK(vx_mem_free(vx_rope_buf));
 }
 
-void multihead_attention(float *xb, float *q, float *k, float *v, float *att,
+void multihead_attention(float *sxb, float *sq, float *sk, float *sv,
+                         float *satt, float *key_cache, float *value_cache,
                          int n_heads, int seq_len, int head_size, int kv_dim,
-                         int kv_mul) {
-  // iterate over all heads
+                         int kv_mul, int pos, int loff) {
   int h;
 #pragma omp parallel for private(h)
   for (h = 0; h < n_heads; h++) {
     // get the query vector for this head
-    float *q_head = q + h * head_size;
+    float *q = sq + h * head_size;
     // attention scores for this head
-    float *att_head = att + h * seq_len;
+    float *att = satt + h * seq_len;
     // iterate over all timesteps, including the current one
-    for (int t = 0; t < seq_len; t++) {
+    for (int t = 0; t <= pos; t++) {
       // get the key vector for this head and at this timestep
-      float *k_head = k + t * kv_dim + (h / kv_mul) * head_size;
+      float *k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
       // calculate the attention score as the dot product of q and k
       float score = 0.0f;
       for (int i = 0; i < head_size; i++) {
-        score += q_head[i] * k_head[i];
+        score += q[i] * k[i];
       }
       score /= sqrtf(head_size);
       // save the score to the attention buffer
-      att_head[t] = score;
+      att[t] = score;
     }
 
-    // softmax the scores to get attention weights, from 0..seq_len-1
-    // inclusively
-    softmax(att_head, seq_len);
+    // softmax the scores to get attention weights, from 0..pos inclusively
+    softmax(att, pos + 1);
 
     // weighted sum of the values, store back into xb
-    float *xb_head = xb + h * head_size;
-    memset(xb_head, 0, head_size * sizeof(float));
-    for (int t = 0; t < seq_len; t++) {
+    float *xb = sxb + h * head_size;
+    memset(xb, 0, head_size * sizeof(float));
+    for (int t = 0; t <= pos; t++) {
       // get the value vector for this head and at this timestep
-      float *v_head = v + t * kv_dim + (h / kv_mul) * head_size;
+      float *v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
       // get the attention weight for this timestep
-      float a = att_head[t];
+      float a = att[t];
       // accumulate the weighted value into xb
       for (int i = 0; i < head_size; i++) {
-        xb_head[i] += a * v_head[i];
+        xb[i] += a * v[i];
       }
     }
   }
@@ -614,8 +613,9 @@ float* forward(Transformer* transformer, int token, int pos) {
         rope_encoding(dim, kv_dim, head_size, pos, s->q, s->k);
 
         // multihead attention. iterate over all heads
-        multihead_attention(s->xb, s->q, s->k, s->v, s->att, p->n_heads,
-                            pos + 1, head_size, kv_dim, kv_mul);
+        multihead_attention(s->xb, s->q, s->k, s->v, s->att, s->key_cache,
+                            s->value_cache, p->n_heads, p->seq_len, head_size,
+                            kv_dim, kv_mul, pos, loff);
 
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
