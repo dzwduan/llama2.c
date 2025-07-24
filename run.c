@@ -570,6 +570,13 @@ void multihead_attention(float *xb, float *q, float *k, float *v, float *att,
   }
 }
 
+void accum(float *a, float *b, int size) {
+  // accumulate b into a
+  for (int i = 0; i < size; i++) {
+    a[i] += b[i];
+  }
+}
+
 float* forward(Transformer* transformer, int token, int pos) {
 
     // a few convenience variables
@@ -614,9 +621,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
         // residual connection back into x
-        for (int i = 0; i < dim; i++) {
-            x[i] += s->xb2[i];
-        }
+        accum(x, s->xb2, dim);
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
@@ -640,9 +645,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
         // residual connection
-        for (int i = 0; i < dim; i++) {
-            x[i] += s->xb[i];
-        }
+        accum(x, s->xb, dim);
     }
 
     // final rmsnorm
