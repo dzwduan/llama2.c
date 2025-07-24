@@ -29,3 +29,12 @@ typedef struct {
   uint32_t kv_dim;
   uint32_t pos;
 } rope_arg_t;
+
+typedef struct {
+  uint64_t x_addr;
+  uint64_t size;
+  uint32_t elements_per_thread;
+
+  uint64_t global_core_reduce_addr;
+  uint64_t global_reduce_addr;
+} softmax_arg_t;

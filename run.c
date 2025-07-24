@@ -48,6 +48,9 @@ static vx_buffer_h vx_rmsnorm_buf = NULL;
 static const char *vx_rope_kernel = "./kernels/build/rope.vxbin";
 static vx_buffer_h vx_rope_buf = NULL;
 
+static const char *vx_softmax_kernel = "./kernels/build/softmax.vxbin";
+static vx_buffer_h vx_softmax_buf = NULL;
+
 __attribute__((constructor)) static void vortex_module_ctor() {
   // Open Vortex device connection
   RT_CHECK(vx_dev_open(&device));
@@ -328,6 +331,62 @@ void softmax(float* x, int size) {
     for (int i = 0; i < size; i++) {
         x[i] /= sum;
     }
+}
+
+void softmax_vx(float *x, int size) {
+  vx_buffer_h x_buf = NULL;
+  vx_buffer_h global_reduce = NULL;
+  vx_buffer_h global_core_reduce = NULL;
+  softmax_arg_t args = {};
+
+  // Get device capabilities
+  uint64_t num_cores, num_warps, num_threads;
+  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_CORES, &num_cores));
+  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_WARPS, &num_warps));
+  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &num_threads));
+
+  // Allocate buffers
+  size_t x_size = size * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, x_size, VX_MEM_READ_WRITE, &x_buf));
+  RT_CHECK(vx_mem_address(x_buf, &args.x_addr));
+
+  // Allocate global reduce buffer
+  RT_CHECK(
+      vx_mem_alloc(device, sizeof(float), VX_MEM_READ_WRITE, &global_reduce));
+  RT_CHECK(vx_mem_address(global_reduce, &args.global_reduce_addr));
+
+  // Allocate global core reduce buffer
+  RT_CHECK(vx_mem_alloc(device, sizeof(float), VX_MEM_READ_WRITE,
+                        &global_core_reduce));
+  RT_CHECK(vx_mem_address(global_core_reduce, &args.global_core_reduce_addr));
+
+  // Upload x to device
+  RT_CHECK(vx_copy_to_dev(x_buf, x, 0, x_size));
+
+  // Upload kernel arguments
+  args.size = size;
+
+  int total_threads = num_cores * num_warps * num_threads;
+  args.elements_per_thread = divUp(size, total_threads);
+
+  vx_buffer_h softmax_args_buffer;
+  RT_CHECK(vx_upload_bytes(device, &args, sizeof(softmax_arg_t),
+                           &softmax_args_buffer));
+
+  // Upload kernel
+  RT_CHECK(vx_upload_kernel_file(device, vx_softmax_kernel, &vx_softmax_buf));
+
+  // Start the kernel
+  RT_CHECK(vx_start(device, vx_softmax_buf, softmax_args_buffer));
+  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+
+  // Download the output
+  RT_CHECK(vx_copy_from_dev(x, x_buf, 0, x_size));
+
+  // Free the buffers
+  RT_CHECK(vx_mem_free(x_buf));
+  RT_CHECK(vx_mem_free(softmax_args_buffer));
+  RT_CHECK(vx_mem_free(vx_softmax_buf));
 }
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
