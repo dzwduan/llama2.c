@@ -51,6 +51,9 @@ static vx_buffer_h vx_rope_buf = NULL;
 static const char *vx_softmax_kernel = "./kernels/build/softmax.vxbin";
 static vx_buffer_h vx_softmax_buf = NULL;
 
+static const char *vx_accum_kernel = "./kernels/build/accum.vxbin";
+static vx_buffer_h vx_accum_buf = NULL;
+
 __attribute__((constructor)) static void vortex_module_ctor() {
   // Open Vortex device connection
   RT_CHECK(vx_dev_open(&device));
@@ -574,6 +577,51 @@ void accum(float *a, float *b, int size) {
   for (int i = 0; i < size; i++) {
     a[i] += b[i];
   }
+}
+
+void accum_vx(float *a, float *b, int size) {
+  vx_buffer_h a_buf = NULL;
+  vx_buffer_h b_buf = NULL;
+  accum_arg_t args = {};
+
+  // Allocate buffers
+  // a (size,) size: size * sizeof(float)
+  size_t a_size = size * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, a_size, VX_MEM_READ_WRITE, &a_buf));
+  RT_CHECK(vx_mem_address(a_buf, &args.a_addr));
+
+  // b (size,) size: size * sizeof(float)
+  size_t b_size = size * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, b_size, VX_MEM_READ_WRITE, &b_buf));
+  RT_CHECK(vx_mem_address(b_buf, &args.b_addr));
+
+  // Upload b to device
+  RT_CHECK(vx_copy_to_dev(b_buf, b, 0, b_size));
+  // Upload a to device
+  RT_CHECK(vx_copy_to_dev(a_buf, a, 0, a_size));
+
+  // Upload kernel arguments
+  args.size = size;
+
+  vx_buffer_h accum_args_buffer;
+  RT_CHECK(
+      vx_upload_bytes(device, &args, sizeof(accum_arg_t), &accum_args_buffer));
+
+  // Upload kernel
+  RT_CHECK(vx_upload_kernel_file(device, vx_accum_kernel, &vx_accum_buf));
+
+  // Start the kernel
+  RT_CHECK(vx_start(device, vx_accum_buf, accum_args_buffer));
+  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+
+  // Download the output
+  RT_CHECK(vx_copy_from_dev(a, a_buf, 0, a_size));
+
+  // Free the buffers
+  RT_CHECK(vx_mem_free(a_buf));
+  RT_CHECK(vx_mem_free(b_buf));
+  RT_CHECK(vx_mem_free(accum_args_buffer));
+  RT_CHECK(vx_mem_free(vx_accum_buf));
 }
 
 float* forward(Transformer* transformer, int token, int pos) {

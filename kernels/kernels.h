@@ -38,3 +38,9 @@ typedef struct {
   uint64_t global_core_reduce_addr;
   uint64_t global_reduce_addr;
 } softmax_arg_t;
+
+typedef struct {
+  uint64_t a_addr;
+  uint64_t b_addr;
+  uint32_t size;
+} accum_arg_t;
