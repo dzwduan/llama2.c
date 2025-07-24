@@ -45,6 +45,9 @@ static vx_buffer_h vx_gemv_buf = NULL;
 static const char *vx_rmsnorm_kernel = "./kernels/build/rmsnorm.vxbin";
 static vx_buffer_h vx_rmsnorm_buf = NULL;
 
+static const char *vx_rope_kernel = "./kernels/build/rope.vxbin";
+static vx_buffer_h vx_rope_buf = NULL;
+
 __attribute__((constructor)) static void vortex_module_ctor() {
   // Open Vortex device connection
   RT_CHECK(vx_dev_open(&device));
@@ -411,6 +414,56 @@ void rope_encoding(int dim, int kv_dim, int head_size, float pos, float *q,
       vec[i + 1] = v0 * fci + v1 * fcr;
     }
   }
+}
+
+void rope_encoding_vx(int dim, int kv_dim, int head_size, float pos, float *q,
+                      float *k) {
+  vx_buffer_h q_buf = NULL;
+  vx_buffer_h k_buf = NULL;
+  rope_arg_t args = {};
+
+  // Allocate buffers
+  // q (dim,) size: dim * sizeof(float)
+  size_t q_size = dim * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, q_size, VX_MEM_READ_WRITE, &q_buf));
+  RT_CHECK(vx_mem_address(q_buf, &args.q_addr));
+
+  // k (dim,) size: dim * sizeof(float)
+  size_t k_size = dim * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, k_size, VX_MEM_READ_WRITE, &k_buf));
+  RT_CHECK(vx_mem_address(k_buf, &args.k_addr));
+
+  // Upload q to device
+  RT_CHECK(vx_copy_to_dev(q_buf, q, 0, q_size));
+  // Upload k to device
+  RT_CHECK(vx_copy_to_dev(k_buf, k, 0, k_size));
+
+  // Upload kernel arguments
+  args.dim = dim;
+  args.head_size = head_size;
+  args.kv_dim = kv_dim;
+  args.pos = pos;
+
+  vx_buffer_h rope_args_buffer;
+  RT_CHECK(
+      vx_upload_bytes(device, &args, sizeof(rope_arg_t), &rope_args_buffer));
+
+  // Upload kernel
+  RT_CHECK(vx_upload_kernel_file(device, vx_rope_kernel, &vx_rope_buf));
+
+  // Start the kernel
+  RT_CHECK(vx_start(device, vx_rope_buf, rope_args_buffer));
+  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+
+  // Download the output
+  RT_CHECK(vx_copy_from_dev(q, q_buf, 0, q_size));
+  RT_CHECK(vx_copy_from_dev(k, k_buf, 0, k_size));
+
+  // Free the buffers
+  RT_CHECK(vx_mem_free(q_buf));
+  RT_CHECK(vx_mem_free(k_buf));
+  RT_CHECK(vx_mem_free(rope_args_buffer));
+  RT_CHECK(vx_mem_free(vx_rope_buf));
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
