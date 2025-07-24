@@ -624,6 +624,17 @@ void accum_vx(float *a, float *b, int size) {
   RT_CHECK(vx_mem_free(vx_accum_buf));
 }
 
+void swiglu(float *hb, float *hb2, int hidden_dim) {
+  for (int i = 0; i < hidden_dim; i++) {
+    float val = hb[i];
+    // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+    val *= (1.0f / (1.0f + expf(-val)));
+    // elementwise multiply with w3(x)
+    val *= hb2[i];
+    hb[i] = val;
+  }
+}
+
 float* forward(Transformer* transformer, int token, int pos) {
 
     // a few convenience variables
@@ -680,14 +691,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
         // SwiGLU non-linearity
-        for (int i = 0; i < hidden_dim; i++) {
-            float val = s->hb[i];
-            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            val *= (1.0f / (1.0f + expf(-val)));
-            // elementwise multiply with w3(x)
-            val *= s->hb2[i];
-            s->hb[i] = val;
-        }
+        swiglu(s->hb, s->hb2, hidden_dim);
 
         // final matmul to get the output of the ffn
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
