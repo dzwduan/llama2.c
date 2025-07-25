@@ -6,6 +6,9 @@
 
 #include <cmath>
 
+
+// Deprecated: Multihead Attention will not use this softmax kernel.
+
 void kernel(softmax_arg_t *arg) {
   auto *x = reinterpret_cast<float *>(arg->x_addr);
   auto size = arg->size;

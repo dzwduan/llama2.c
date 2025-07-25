@@ -57,6 +57,10 @@ static vx_buffer_h vx_accum_buf = NULL;
 static const char *vx_swiglu_kernel = "./kernels/build/swiglu.vxbin";
 static vx_buffer_h vx_swiglu_buf = NULL;
 
+static const char *vx_multihead_attention_kernel =
+    "./kernels/build/attention.vxbin";
+static vx_buffer_h vx_attention_buf = NULL;
+
 __attribute__((constructor)) static void vortex_module_ctor() {
   // Open Vortex device connection
   RT_CHECK(vx_dev_open(&device));
@@ -573,6 +577,95 @@ void multihead_attention(float *sxb, float *sq, float *sk, float *sv,
       }
     }
   }
+}
+
+void multihead_attention_vx(float *sxb, float *sq, float *sk, float *sv,
+                            float *satt, float *key_cache, float *value_cache,
+                            int n_heads, int seq_len, int head_size, int kv_dim,
+                            int kv_mul, int pos, int loff) {
+  vx_buffer_h sxb_buf = NULL;
+  vx_buffer_h sq_buf = NULL;
+  vx_buffer_h sk_buf = NULL;
+  vx_buffer_h sv_buf = NULL;
+  vx_buffer_h satt_buf = NULL;
+  vx_buffer_h key_cache_buf = NULL;
+  vx_buffer_h value_cache_buf = NULL;
+  attention_arg_t args = {};
+
+  // Allocate buffers
+  // sxb (dim,) size: n_heads * head_size * sizeof(float)
+  size_t sxb_size = n_heads * head_size * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, sxb_size, VX_MEM_READ_WRITE, &sxb_buf));
+  RT_CHECK(vx_mem_address(sxb_buf, &args.sxb_addr));
+
+  // sq (dim,) size: n_heads * head_size * sizeof(float)
+  size_t sq_size = n_heads * head_size * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, sq_size, VX_MEM_READ, &sq_buf));
+  RT_CHECK(vx_mem_address(sq_buf, &args.sq_addr));
+
+  (void)sk;
+  (void)sv;
+
+  // satt (n_heads, seq_len) size: n_heads * seq_len * sizeof(float)
+  size_t satt_size = n_heads * seq_len * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, satt_size, VX_MEM_READ_WRITE, &satt_buf));
+  RT_CHECK(vx_mem_address(satt_buf, &args.satt_addr));
+
+  // key_cache (n_layers, seq_len, kv_dim) size: n_layers * seq_len * kv_dim *
+  // sizeof(float)
+  size_t key_cache_size = n_heads * seq_len * kv_dim * sizeof(float);
+  RT_CHECK(vx_mem_alloc(device, key_cache_size, VX_MEM_READ, &key_cache_buf));
+  RT_CHECK(vx_mem_address(key_cache_buf, &args.key_cache_addr));
+
+  // value_cache (n_layers, seq_len, kv_dim) size: n_layers * seq_len * kv_dim *
+  // sizeof(float)
+  size_t value_cache_size = n_heads * seq_len * kv_dim * sizeof(float);
+  RT_CHECK(
+      vx_mem_alloc(device, value_cache_size, VX_MEM_READ, &value_cache_buf));
+  RT_CHECK(vx_mem_address(value_cache_buf, &args.value_cache_addr));
+
+  // Upload sxb to device
+  RT_CHECK(vx_copy_to_dev(sxb_buf, sxb, 0, sxb_size));
+  // Upload sq to device
+  RT_CHECK(vx_copy_to_dev(sq_buf, sq, 0, sq_size));
+  // Upload satt to device
+  RT_CHECK(vx_copy_to_dev(satt_buf, satt, 0, satt_size));
+  // Upload key_cache to device
+  RT_CHECK(vx_copy_to_dev(key_cache_buf, key_cache, 0, key_cache_size));
+  // Upload value_cache to device
+  RT_CHECK(vx_copy_to_dev(value_cache_buf, value_cache, 0, value_cache_size));
+
+  // Upload kernel arguments
+  args.n_heads = n_heads;
+  args.seq_len = seq_len;
+  args.head_size = head_size;
+  args.kv_dim = kv_dim;
+  args.kv_mul = kv_mul;
+  args.pos = pos;
+  args.loff = loff;
+
+  vx_buffer_h attention_args_buffer;
+  RT_CHECK(vx_upload_bytes(device, &args, sizeof(attention_arg_t),
+                           &attention_args_buffer));
+
+  // Upload kernel
+  RT_CHECK(vx_upload_kernel_file(device, vx_multihead_attention_kernel,
+                                 &vx_attention_buf));
+  // Start the kernel
+  RT_CHECK(vx_start(device, vx_attention_buf, attention_args_buffer));
+  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
+
+  // Download the output
+  RT_CHECK(vx_copy_from_dev(sxb, sxb_buf, 0, sxb_size));
+  
+  // Free the buffers
+  RT_CHECK(vx_mem_free(sxb_buf));
+  RT_CHECK(vx_mem_free(sq_buf));
+  RT_CHECK(vx_mem_free(satt_buf));
+  RT_CHECK(vx_mem_free(key_cache_buf));
+  RT_CHECK(vx_mem_free(value_cache_buf));
+  RT_CHECK(vx_mem_free(attention_args_buffer));
+  RT_CHECK(vx_mem_free(vx_attention_buf));
 }
 
 void accum(float *a, float *b, int size) {
