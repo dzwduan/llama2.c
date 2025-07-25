@@ -16,9 +16,6 @@ typedef struct {
   uint64_t w_addr;
   uint64_t size;
   uint64_t elements_per_thread;
-
-  uint64_t global_ss_addr;
-  uint64_t global_sums_addr;
 } rmsnorm_arg_t;
 
 typedef struct {

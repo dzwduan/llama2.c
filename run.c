@@ -255,8 +255,6 @@ void rmsnorm_vx(float *o, float *x, float *weight, int size) {
   vx_buffer_h o_buf = NULL;
   vx_buffer_h x_buf = NULL;
   vx_buffer_h w_buf = NULL;
-  vx_buffer_h global_ss_buf = NULL;
-  vx_buffer_h global_sums_buf = NULL;
   rmsnorm_arg_t args = {};
 
   uint64_t num_cores, num_warps, num_threads;
@@ -280,16 +278,6 @@ void rmsnorm_vx(float *o, float *x, float *weight, int size) {
   RT_CHECK(vx_mem_alloc(device, w_size, VX_MEM_READ, &w_buf));
   RT_CHECK(vx_mem_address(w_buf, &args.w_addr));
 
-  // Allocate global buffers for vortex kernel
-  RT_CHECK(
-      vx_mem_alloc(device, sizeof(float), VX_MEM_READ_WRITE, &global_ss_buf));
-  RT_CHECK(vx_mem_address(global_ss_buf, &args.global_ss_addr));
-
-  // Allocate global sums buffer
-  RT_CHECK(vx_mem_alloc(device, sizeof(float) * num_cores, VX_MEM_READ_WRITE,
-                        &global_sums_buf));
-  RT_CHECK(vx_mem_address(global_sums_buf, &args.global_sums_addr));
-
   // Upload x to device
   RT_CHECK(vx_copy_to_dev(x_buf, x, 0, x_size));
   // Upload weight to device
@@ -298,7 +286,7 @@ void rmsnorm_vx(float *o, float *x, float *weight, int size) {
   // Upload kernel arguments
   args.size = size;
 
-  int total_threads = num_cores * num_warps * num_threads;
+  int total_threads = num_warps * num_threads;
   args.elements_per_thread = divUp(size, total_threads);
 
   vx_buffer_h rmsnorm_args_buffer;
