@@ -1,5 +1,5 @@
 # Vortex toolchain
-VORTEX_TOOLDIR ?= $(abspath ../../../toolchains/vortex-tools)
+VORTEX_TOOLDIR ?= $(abspath ../../tools)
 VORTEX_LLVM ?= $(VORTEX_TOOLDIR)/llvm-vortex
 VORTEX_RISCV_TOOLCHAIN_PATH ?= $(VORTEX_TOOLDIR)/riscv64-gnu-toolchain
 VORTEX_RISCV_PREFIX  ?= riscv64-unknown-elf

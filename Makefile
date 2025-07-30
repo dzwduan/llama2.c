@@ -3,7 +3,7 @@
 CC = gcc
 
 # Vortex Support
-VORTEX_HOME ?= $(abspath ../vortex)
+VORTEX_HOME ?= $(abspath ../../vortex)
 VORTEX_BUILD_DIR ?= $(VORTEX_HOME)/build
 VORTEX_RT_PATH ?= $(VORTEX_BUILD_DIR)/runtime
 VORTEX_KN_PATH ?= $(VORTEX_BUILD_DIR)/kernel
@@ -97,5 +97,11 @@ build_kernels:
 .PHONY: run-vortex
 run-vortex: rundebug build_kernels
 	@echo "\033[1;32m====== RUNNING =======\033[0m"
-	@LD_LIBRARY_PATH=$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=simx ./run stories15M.bin -n 32 -i "HelloWorld!" -s 256
+	@LD_LIBRARY_PATH=$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=simx ./run stories15M.bin -c -n 32 -i "HelloWorld!" -s 256
+	@echo "\033[1;32m====== FINISHED ======\033[0m"
+
+.PHONY: run-vortex-perf
+run-vortex-perf: rundebug build_kernels
+	@echo "\033[1;32m====== RUNNING =======\033[0m"
+	@LD_LIBRARY_PATH=$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=simx ./run stories15M.bin -a -n 32 -i "HelloWorld!" -s 256
 	@echo "\033[1;32m====== FINISHED ======\033[0m"

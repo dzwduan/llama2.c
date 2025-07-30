@@ -17,6 +17,14 @@
 
 #include "vortex.h"
 #include "kernels/kernels.h"
+#include "perf.h"
+
+// Globals for comparison mode
+static bool g_enable_comparison = false;
+// 用于启用性能分析的全局标志
+static bool g_enable_timing_analysis = false;
+
+
 
 // ----------------------------------------------------------------------------
 // Vortex
@@ -57,9 +65,11 @@ static vx_buffer_h vx_accum_buf = NULL;
 static const char *vx_swiglu_kernel = "./kernels/build/swiglu.vxbin";
 static vx_buffer_h vx_swiglu_buf = NULL;
 
-static const char *vx_multihead_attention_kernel =
-    "./kernels/build/attention.vxbin";
+static const char *vx_multihead_attention_kernel = "./kernels/build/attention.vxbin";
 static vx_buffer_h vx_attention_buf = NULL;
+
+// static const char * vx_tcu_matmul_kernel = "./kernels/build/tcu_matmul.vxbin";
+// static vx_buffer_h vx_tcu_matmul_buf = NULL;
 
 __attribute__((constructor)) static void vortex_module_ctor() {
   // Open Vortex device connection
@@ -128,6 +138,37 @@ typedef struct {
     float* data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
+
+
+//=============================== helper function definitions =========================
+
+void compare_results(const char* name, const float* cpu_out, const float* gpu_out, int size) {
+    int mismatches = 0;
+    float max_diff = 0.0f;
+    const float epsilon = 1e-3f; // Tolerance for float comparison
+
+    for (int i = 0; i < size; ++i) {
+        float diff = fabsf(cpu_out[i] - gpu_out[i]);
+        if (diff > epsilon) {
+            if (mismatches < 5) { // Print first 5 mismatches
+                fprintf(stderr, "\033[31mMismatch in %s at index %d: CPU=%.6f, GPU=%.6f, Diff=%.6f\033[0m\n", name, i, cpu_out[i], gpu_out[i], diff);
+            }
+            mismatches++;
+            if (diff > max_diff) {
+                max_diff = diff;
+            }
+        }
+    }
+
+    if (mismatches > 0) {
+        fprintf(stderr, "\033[31m-------> %s: FAILED! Total mismatches: %d / %d. Max difference: %.6f\033[0m\n", name, mismatches, size, max_diff);
+    } else {
+        printf("\033[32m-------> %s: OK\033[0m\n", name);
+    }
+}
+
+
+//====================================================================================
 
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
@@ -764,6 +805,7 @@ void swiglu_vx(float *hb, float *hb2, int hidden_dim) {
   RT_CHECK(vx_mem_free(vx_swiglu_buf));
 }
 
+
 float* forward(Transformer* transformer, int token, int pos) {
 
     // a few convenience variables
@@ -773,9 +815,18 @@ float* forward(Transformer* transformer, int token, int pos) {
     float *x = s->x;
     int dim = p->dim;
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
+    int kv_mul = p->n_heads / p->n_kv_heads;
     int hidden_dim =  p->hidden_dim;
     int head_size = dim / p->n_heads;
+
+    // --- Performance Analysis Variables ---
+    PerfData pos_perf_data[NUM_OPS];
+    if (g_enable_timing_analysis) {
+        init_perf_data(pos_perf_data, NUM_OPS);
+    }
+    long long start_us, end_us;
+    char dim_str_buffer[32];
+    // --- End Performance Analysis Variables ---
 
     // copy the token embedding into x
     float* content_row = w->token_embedding_table + token * dim;
@@ -784,58 +835,874 @@ float* forward(Transformer* transformer, int token, int pos) {
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
-        // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+        // Attention rmsnorm
+        if (g_enable_comparison) {
+            float* cpu_out = malloc(dim * sizeof(float));
+            printf("\n[L%llu P%d] Comparing RMSNorm (Attention)...\n", l, pos);
+            rmsnorm(cpu_out, x, w->rms_att_weight + l*dim, dim);
+            rmsnorm_vx(s->xb, x, w->rms_att_weight + l*dim, dim);
+            compare_results("rmsnorm_att", cpu_out, s->xb, dim);
+            free(cpu_out);
+        } else if (g_enable_timing_analysis) {
+            start_us = time_in_us();
+            rmsnorm_vx(s->xb, x, w->rms_att_weight + l*dim, dim);
+            end_us = time_in_us();
+            record_perf(pos_perf_data, OP_RMSNORM_ATT, start_us, end_us, NULL);
+        } else {
+            rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+        }
 
         // key and value point to the kv cache
-        int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
+        int loff = l * p->seq_len * kv_dim;
         s->k = s->key_cache + loff + pos * kv_dim;
         s->v = s->value_cache + loff + pos * kv_dim;
 
-        // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+        // QKV matmuls for this position
+        if (g_enable_comparison) {
+            float* cpu_q = malloc(dim * sizeof(float));
+            float* cpu_k = malloc(kv_dim * sizeof(float));
+            float* cpu_v = malloc(kv_dim * sizeof(float));
+            printf("[L%llu P%d] Comparing MatMul (Q, K, V)...\n", l, pos);
+            matmul(cpu_q, s->xb, w->wq + l*dim*dim, dim, dim);
+            matmul_vx(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+            compare_results("matmul_q", cpu_q, s->q, dim);
+            matmul(cpu_k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+            matmul_vx(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+            compare_results("matmul_k", cpu_k, s->k, kv_dim);
+            matmul(cpu_v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+            matmul_vx(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+            compare_results("matmul_v", cpu_v, s->v, kv_dim);
+            free(cpu_q); free(cpu_k); free(cpu_v);
+        } else if (g_enable_timing_analysis) {
+            // Matmul Q
+            start_us = time_in_us();
+            matmul_vx(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+            end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, dim);
+            record_perf(pos_perf_data, OP_MATMUL_Q, start_us, end_us, dim_str_buffer);
+            
+            // Matmul K
+            start_us = time_in_us();
+            matmul_vx(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+            end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, kv_dim);
+            record_perf(pos_perf_data, OP_MATMUL_K, start_us, end_us, dim_str_buffer);
+            
+            // Matmul V
+            start_us = time_in_us();
+            matmul_vx(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+            end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, kv_dim);
+            record_perf(pos_perf_data, OP_MATMUL_V, start_us, end_us, dim_str_buffer);
+        } else {
+            matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+            matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+            matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+        }
 
-        // RoPE relative positional encoding: complex-valued rotate q and k in each head
-        rope_encoding(dim, kv_dim, head_size, pos, s->q, s->k);
+        // RoPE relative positional encoding
+        if (g_enable_comparison) {
+            float* cpu_q = malloc(dim * sizeof(float));
+            float* cpu_k = malloc(kv_dim * sizeof(float));
+            memcpy(cpu_q, s->q, dim * sizeof(float));
+            memcpy(cpu_k, s->k, kv_dim * sizeof(float));
+            printf("[L%llu P%d] Comparing RoPE...\n", l, pos);
+            rope_encoding(dim, kv_dim, head_size, pos, cpu_q, cpu_k);
+            rope_encoding_vx(dim, kv_dim, head_size, pos, s->q, s->k);
+            compare_results("rope_q", cpu_q, s->q, dim);
+            compare_results("rope_k", cpu_k, s->k, kv_dim);
+            free(cpu_q); free(cpu_k);
+        } else if (g_enable_timing_analysis) {
+            start_us = time_in_us();
+            rope_encoding_vx(dim, kv_dim, head_size, pos, s->q, s->k);
+            end_us = time_in_us();
+            record_perf(pos_perf_data, OP_ROPE, start_us, end_us, NULL);
+        } else {
+            rope_encoding(dim, kv_dim, head_size, pos, s->q, s->k);
+        }
 
-        // multihead attention. iterate over all heads
-        multihead_attention(s->xb, s->q, s->k, s->v, s->att, s->key_cache,
-                            s->value_cache, p->n_heads, p->seq_len, head_size,
-                            kv_dim, kv_mul, pos, loff);
+        // Multihead attention
+        if (g_enable_comparison) {
+            float* cpu_xb = malloc(dim * sizeof(float));
+            float* cpu_att = malloc(p->n_heads * p->seq_len * sizeof(float));
+            memcpy(cpu_xb, s->xb, dim * sizeof(float));
+            memcpy(cpu_att, s->att, p->n_heads * p->seq_len * sizeof(float));
+            printf("[L%llu P%d] Comparing Multi-Head Attention...\n", l, pos);
+            multihead_attention(cpu_xb, s->q, s->k, s->v, cpu_att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+            multihead_attention_vx(s->xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+            compare_results("multihead_attention_xb", cpu_xb, s->xb, dim);
+            free(cpu_xb);
+            free(cpu_att);
+        } else if (g_enable_timing_analysis) {
+            start_us = time_in_us();
+            multihead_attention_vx(s->xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+            end_us = time_in_us();
+            record_perf(pos_perf_data, OP_ATTENTION, start_us, end_us, NULL);
+        } else {
+            multihead_attention(s->xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+        }
 
-        // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        // Final matmul (WO)
+        if (g_enable_comparison) {
+            float* cpu_out = malloc(dim * sizeof(float));
+            printf("[L%llu P%d] Comparing MatMul (WO)...\n", l, pos);
+            matmul(cpu_out, s->xb, w->wo + l*dim*dim, dim, dim);
+            matmul_vx(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+            compare_results("matmul_wo", cpu_out, s->xb2, dim);
+            free(cpu_out);
+        } else if (g_enable_timing_analysis) {
+            start_us = time_in_us();
+            matmul_vx(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+            end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, dim);
+            record_perf(pos_perf_data, OP_MATMUL_WO, start_us, end_us, dim_str_buffer);
+        } else {
+            matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        }
 
-        // residual connection back into x
-        accum(x, s->xb2, dim);
+        // Residual connection
+        if (g_enable_comparison) {
+            float* cpu_x = malloc(dim * sizeof(float));
+            memcpy(cpu_x, x, dim * sizeof(float));
+            printf("[L%llu P%d] Comparing Accum (Attention)...\n", l, pos);
+            accum(cpu_x, s->xb2, dim);
+            accum_vx(x, s->xb2, dim);
+            compare_results("accum_att", cpu_x, x, dim);
+            free(cpu_x);
+        } else if (g_enable_timing_analysis) {
+            start_us = time_in_us();
+            accum_vx(x, s->xb2, dim);
+            end_us = time_in_us();
+            record_perf(pos_perf_data, OP_ACCUM_ATT, start_us, end_us, NULL);
+        } else {
+            accum(x, s->xb2, dim);
+        }
 
-        // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+        // FFN rmsnorm
+        if (g_enable_comparison) {
+            float* cpu_out = malloc(dim * sizeof(float));
+            printf("[L%llu P%d] Comparing RMSNorm (FFN)...\n", l, pos);
+            rmsnorm(cpu_out, x, w->rms_ffn_weight + l*dim, dim);
+            rmsnorm_vx(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+            compare_results("rmsnorm_ffn", cpu_out, s->xb, dim);
+            free(cpu_out);
+        } else if (g_enable_timing_analysis) {
+            start_us = time_in_us();
+            rmsnorm_vx(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+            end_us = time_in_us();
+            record_perf(pos_perf_data, OP_RMSNORM_FFN, start_us, end_us, NULL);
+        } else {
+            rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+        }
+        
+        // FFN matmuls (w1, w3)
+        if (g_enable_comparison) {
+            float* cpu_hb = malloc(hidden_dim * sizeof(float));
+            float* cpu_hb2 = malloc(hidden_dim * sizeof(float));
+            printf("[L%llu P%d] Comparing MatMul (W1, W3)...\n", l, pos);
+            matmul(cpu_hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+            matmul_vx(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+            compare_results("matmul_w1", cpu_hb, s->hb, hidden_dim);
+            matmul(cpu_hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+            matmul_vx(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+            compare_results("matmul_w3", cpu_hb2, s->hb2, hidden_dim);
+            free(cpu_hb); free(cpu_hb2);
+        } else if (g_enable_timing_analysis) {
+            // Matmul W1
+            start_us = time_in_us();
+            matmul_vx(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+            end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, hidden_dim);
+            record_perf(pos_perf_data, OP_MATMUL_W1, start_us, end_us, dim_str_buffer);
 
-        // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-        // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+            // Matmul W3
+            start_us = time_in_us();
+            matmul_vx(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+            end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, hidden_dim);
+            record_perf(pos_perf_data, OP_MATMUL_W3, start_us, end_us, dim_str_buffer);
+        } else {
+            matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+            matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        }
 
-        // SwiGLU non-linearity
-        swiglu(s->hb, s->hb2, hidden_dim);
+        // SwiGLU
+        if (g_enable_comparison) {
+            float* cpu_hb = malloc(hidden_dim * sizeof(float));
+            memcpy(cpu_hb, s->hb, hidden_dim * sizeof(float));
+            printf("[L%llu P%d] Comparing SwiGLU...\n", l, pos);
+            swiglu(cpu_hb, s->hb2, hidden_dim);
+            swiglu_vx(s->hb, s->hb2, hidden_dim);
+            compare_results("swiglu", cpu_hb, s->hb, hidden_dim);
+            free(cpu_hb);
+        } else if (g_enable_timing_analysis) {
+            start_us = time_in_us();
+            swiglu_vx(s->hb, s->hb2, hidden_dim);
+            end_us = time_in_us();
+            record_perf(pos_perf_data, OP_SWIGLU, start_us, end_us, NULL);
+        } else {
+            swiglu(s->hb, s->hb2, hidden_dim);
+        }
 
-        // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+        // Final FFN matmul (W2)
+        if (g_enable_comparison) {
+            float* cpu_out = malloc(dim * sizeof(float));
+            printf("[L%llu P%d] Comparing MatMul (W2)...\n", l, pos);
+            matmul(cpu_out, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+            matmul_vx(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+            compare_results("matmul_w2", cpu_out, s->xb, dim);
+            free(cpu_out);
+        } else if (g_enable_timing_analysis) {
+            start_us = time_in_us();
+            matmul_vx(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+            end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", hidden_dim, hidden_dim, dim);
+            record_perf(pos_perf_data, OP_MATMUL_W2, start_us, end_us, dim_str_buffer);
+        } else {
+            matmul(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+        }
 
-        // residual connection
-        accum(x, s->xb, dim);
+        // Residual connection
+        if (g_enable_comparison) {
+            float* cpu_x = malloc(dim * sizeof(float));
+            memcpy(cpu_x, x, dim * sizeof(float));
+            printf("[L%llu P%d] Comparing Accum (FFN)...\n", l, pos);
+            accum(cpu_x, s->xb, dim);
+            accum_vx(x, s->xb, dim);
+            compare_results("accum_ffn", cpu_x, x, dim);
+            free(cpu_x);
+        } else if (g_enable_timing_analysis) {
+            start_us = time_in_us();
+            accum_vx(x, s->xb, dim);
+            end_us = time_in_us();
+            record_perf(pos_perf_data, OP_ACCUM_FFN, start_us, end_us, NULL);
+        } else {
+            accum(x, s->xb, dim);
+        }
     }
 
-    // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, dim);
+    // Final rmsnorm
+    if (g_enable_comparison) {
+        float* cpu_out = malloc(dim * sizeof(float));
+        float* x_input_copy = malloc(dim * sizeof(float));
+        memcpy(x_input_copy, x, dim * sizeof(float));
+        printf("[P%d] Comparing RMSNorm (Final)...\n", pos);
+        rmsnorm(cpu_out, x_input_copy, w->rms_final_weight, dim);
+        rmsnorm_vx(x, x_input_copy, w->rms_final_weight, dim);
+        compare_results("rmsnorm_final", cpu_out, x, dim);
+        free(cpu_out);
+        free(x_input_copy);
+    } else if (g_enable_timing_analysis) {
+        start_us = time_in_us();
+        rmsnorm_vx(x, x, w->rms_final_weight, dim);
+        end_us = time_in_us();
+        record_perf(pos_perf_data, OP_RMSNORM_FINAL, start_us, end_us, NULL);
+    } else {
+        rmsnorm(x, x, w->rms_final_weight, dim);
+    }
 
-    // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    // Classifier into logits
+    if (g_enable_comparison) {
+        float* cpu_logits = malloc(p->vocab_size * sizeof(float));
+        printf("[P%d] Comparing MatMul (Classifier)...\n", pos);
+        matmul(cpu_logits, x, w->wcls, p->dim, p->vocab_size);
+        matmul_vx(s->logits, x, w->wcls, p->dim, p->vocab_size);
+        compare_results("matmul_classifier", cpu_logits, s->logits, p->vocab_size);
+        free(cpu_logits);
+    } else if (g_enable_timing_analysis) {
+        start_us = time_in_us();
+        matmul_vx(s->logits, x, w->wcls, p->dim, p->vocab_size);
+        end_us = time_in_us();
+        snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", p->dim, p->dim, p->vocab_size);
+        record_perf(pos_perf_data, OP_MATMUL_CLS, start_us, end_us, dim_str_buffer);
+    } else {
+        matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    }
+
+    // --- Print Performance Analysis Report ---
+    if (g_enable_timing_analysis) {
+        long long total_pos_time_us = 0;
+        for (int i = 0; i < NUM_OPS; i++) {
+            total_pos_time_us += pos_perf_data[i].total_time_us;
+        }
+
+        printf("\n\033[1;33m--- Timing Analysis for Position %d ---\033[0m\n", pos);
+        printf("\033[1;33m----------------------------------------------------------------------------------------\033[0m\n");
+        printf("\033[1;33m%-24s | %-24s | %12s | %s\033[0m\n", "Operator", "Dimensions", "Time (us)", "Percentage");
+        printf("\033[1;33m----------------------------------------------------------------------------------------\033[0m\n");
+
+        for (int i = 0; i < NUM_OPS; i++) {
+            if (pos_perf_data[i].call_count > 0) {
+                double percentage = (total_pos_time_us > 0) ? ((double)pos_perf_data[i].total_time_us / total_pos_time_us * 100.0) : 0.0;
+                printf("%-24s | %-24s | %12lld | %9.2f%%\n",
+                       op_names[i],
+                       pos_perf_data[i].dim_info,
+                       pos_perf_data[i].total_time_us,
+                       percentage);
+            }
+        }
+        printf("----------------------------------------------------------------------------------------\n");
+        printf("\033[1;33m%-24s | %-24s | %12lld | %9.2f%%\033[0m\n", "Total Position Time", "", total_pos_time_us, 100.0);
+        printf("\033[1;33m----------------------------------------------------------------------------------------\033[0m\n\n");
+        fflush(stdout);
+    }
+    // --- End Report ---
+
     return s->logits;
 }
+
+// float* forward(Transformer* transformer, int token, int pos) {
+
+//     // a few convenience variables
+//     Config* p = &transformer->config;
+//     TransformerWeights* w = &transformer->weights;
+//     RunState* s = &transformer->state;
+//     float *x = s->x;
+//     int dim = p->dim;
+//     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+//     int kv_mul = p->n_heads / p->n_kv_heads;
+//     int hidden_dim =  p->hidden_dim;
+//     int head_size = dim / p->n_heads;
+
+//     // --- 开始：性能分析计时变量 ---
+//     long long pos_op_time_us[NUM_OPS] = {0};
+//     long long start_us, end_us;
+//     // --- 结束：性能分析计时变量 ---
+
+//     // copy the token embedding into x
+//     float* content_row = w->token_embedding_table + token * dim;
+//     memcpy(x, content_row, dim*sizeof(*x));
+
+//     // forward all the layers
+//     for(unsigned long long l = 0; l < p->n_layers; l++) {
+
+//         // Attention rmsnorm
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("\n[L%llu P%d] Comparing RMSNorm (Attention)...\n", l, pos);
+//             rmsnorm(cpu_out, x, w->rms_att_weight + l*dim, dim);
+//             rmsnorm_vx(s->xb, x, w->rms_att_weight + l*dim, dim);
+//             compare_results("rmsnorm_att", cpu_out, s->xb, dim);
+//             free(cpu_out);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             rmsnorm_vx(s->xb, x, w->rms_att_weight + l*dim, dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_RMSNORM_ATT] += (end_us - start_us);
+//         } else {
+//             rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+//         }
+
+//         // key and value point to the kv cache
+//         int loff = l * p->seq_len * kv_dim;
+//         s->k = s->key_cache + loff + pos * kv_dim;
+//         s->v = s->value_cache + loff + pos * kv_dim;
+
+//         // QKV matmuls for this position
+//         if (g_enable_comparison) {
+//             float* cpu_q = malloc(dim * sizeof(float));
+//             float* cpu_k = malloc(kv_dim * sizeof(float));
+//             float* cpu_v = malloc(kv_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (Q, K, V)...\n", l, pos);
+//             matmul(cpu_q, s->xb, w->wq + l*dim*dim, dim, dim);
+//             matmul_vx(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+//             compare_results("matmul_q", cpu_q, s->q, dim);
+//             matmul(cpu_k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+//             matmul_vx(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+//             compare_results("matmul_k", cpu_k, s->k, kv_dim);
+//             matmul(cpu_v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+//             matmul_vx(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+//             compare_results("matmul_v", cpu_v, s->v, kv_dim);
+//             free(cpu_q); free(cpu_k); free(cpu_v);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             matmul_vx(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_MATMUL_Q] += (end_us - start_us);
+            
+//             start_us = time_in_us();
+//             matmul_vx(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_MATMUL_K] += (end_us - start_us);
+            
+//             start_us = time_in_us();
+//             matmul_vx(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_MATMUL_V] += (end_us - start_us);
+//         } else {
+//             matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+//             matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+//             matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+//         }
+
+//         // RoPE relative positional encoding
+//         if (g_enable_comparison) {
+//             float* cpu_q = malloc(dim * sizeof(float));
+//             float* cpu_k = malloc(kv_dim * sizeof(float));
+//             memcpy(cpu_q, s->q, dim * sizeof(float));
+//             memcpy(cpu_k, s->k, kv_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing RoPE...\n", l, pos);
+//             rope_encoding(dim, kv_dim, head_size, pos, cpu_q, cpu_k);
+//             rope_encoding_vx(dim, kv_dim, head_size, pos, s->q, s->k);
+//             compare_results("rope_q", cpu_q, s->q, dim);
+//             compare_results("rope_k", cpu_k, s->k, kv_dim);
+//             free(cpu_q); free(cpu_k);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             rope_encoding_vx(dim, kv_dim, head_size, pos, s->q, s->k);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_ROPE] += (end_us - start_us);
+//         } else {
+//             rope_encoding(dim, kv_dim, head_size, pos, s->q, s->k);
+//         }
+
+//         // Multihead attention
+//         if (g_enable_comparison) {
+//             float* cpu_xb = malloc(dim * sizeof(float));
+//             float* cpu_att = malloc(p->n_heads * p->seq_len * sizeof(float));
+//             memcpy(cpu_xb, s->xb, dim * sizeof(float));
+//             memcpy(cpu_att, s->att, p->n_heads * p->seq_len * sizeof(float));
+//             printf("[L%llu P%d] Comparing Multi-Head Attention...\n", l, pos);
+//             multihead_attention(cpu_xb, s->q, s->k, s->v, cpu_att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+//             multihead_attention_vx(s->xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+//             compare_results("multihead_attention_xb", cpu_xb, s->xb, dim);
+//             free(cpu_xb);
+//             free(cpu_att);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             multihead_attention_vx(s->xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_ATTENTION] += (end_us - start_us);
+//         } else {
+//             multihead_attention(s->xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+//         }
+
+//         // Final matmul (WO)
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (WO)...\n", l, pos);
+//             matmul(cpu_out, s->xb, w->wo + l*dim*dim, dim, dim);
+//             matmul_vx(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+//             compare_results("matmul_wo", cpu_out, s->xb2, dim);
+//             free(cpu_out);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             matmul_vx(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_MATMUL_WO] += (end_us - start_us);
+//         } else {
+//             matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+//         }
+
+//         // Residual connection
+//         if (g_enable_comparison) {
+//             float* cpu_x = malloc(dim * sizeof(float));
+//             memcpy(cpu_x, x, dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing Accum (Attention)...\n", l, pos);
+//             accum(cpu_x, s->xb2, dim);
+//             accum_vx(x, s->xb2, dim);
+//             compare_results("accum_att", cpu_x, x, dim);
+//             free(cpu_x);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             accum_vx(x, s->xb2, dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_ACCUM_ATT] += (end_us - start_us);
+//         } else {
+//             accum(x, s->xb2, dim);
+//         }
+
+//         // FFN rmsnorm
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing RMSNorm (FFN)...\n", l, pos);
+//             rmsnorm(cpu_out, x, w->rms_ffn_weight + l*dim, dim);
+//             rmsnorm_vx(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+//             compare_results("rmsnorm_ffn", cpu_out, s->xb, dim);
+//             free(cpu_out);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             rmsnorm_vx(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_RMSNORM_FFN] += (end_us - start_us);
+//         } else {
+//             rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+//         }
+        
+//         // FFN matmuls (w1, w3)
+//         if (g_enable_comparison) {
+//             float* cpu_hb = malloc(hidden_dim * sizeof(float));
+//             float* cpu_hb2 = malloc(hidden_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (W1, W3)...\n", l, pos);
+//             matmul(cpu_hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+//             matmul_vx(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+//             compare_results("matmul_w1", cpu_hb, s->hb, hidden_dim);
+//             matmul(cpu_hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+//             matmul_vx(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+//             compare_results("matmul_w3", cpu_hb2, s->hb2, hidden_dim);
+//             free(cpu_hb); free(cpu_hb2);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             matmul_vx(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_MATMUL_W1] += (end_us - start_us);
+
+//             start_us = time_in_us();
+//             matmul_vx(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_MATMUL_W3] += (end_us - start_us);
+//         } else {
+//             matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+//             matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+//         }
+
+//         // SwiGLU
+//         if (g_enable_comparison) {
+//             float* cpu_hb = malloc(hidden_dim * sizeof(float));
+//             memcpy(cpu_hb, s->hb, hidden_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing SwiGLU...\n", l, pos);
+//             swiglu(cpu_hb, s->hb2, hidden_dim);
+//             swiglu_vx(s->hb, s->hb2, hidden_dim);
+//             compare_results("swiglu", cpu_hb, s->hb, hidden_dim);
+//             free(cpu_hb);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             swiglu_vx(s->hb, s->hb2, hidden_dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_SWIGLU] += (end_us - start_us);
+//         } else {
+//             swiglu(s->hb, s->hb2, hidden_dim);
+//         }
+
+//         // Final FFN matmul (W2)
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (W2)...\n", l, pos);
+//             matmul(cpu_out, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+//             matmul_vx(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+//             compare_results("matmul_w2", cpu_out, s->xb, dim);
+//             free(cpu_out);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             matmul_vx(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_MATMUL_W2] += (end_us - start_us);
+//         } else {
+//             matmul(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+//         }
+
+//         // Residual connection
+//         if (g_enable_comparison) {
+//             float* cpu_x = malloc(dim * sizeof(float));
+//             memcpy(cpu_x, x, dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing Accum (FFN)...\n", l, pos);
+//             accum(cpu_x, s->xb, dim);
+//             accum_vx(x, s->xb, dim);
+//             compare_results("accum_ffn", cpu_x, x, dim);
+//             free(cpu_x);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             accum_vx(x, s->xb, dim);
+//             end_us = time_in_us();
+//             pos_op_time_us[OP_ACCUM_FFN] += (end_us - start_us);
+//         } else {
+//             accum(x, s->xb, dim);
+//         }
+//     }
+
+//     // Final rmsnorm
+//     if (g_enable_comparison) {
+//         float* cpu_out = malloc(dim * sizeof(float));
+//         float* x_input_copy = malloc(dim * sizeof(float));
+//         memcpy(x_input_copy, x, dim * sizeof(float));
+//         printf("[P%d] Comparing RMSNorm (Final)...\n", pos);
+//         rmsnorm(cpu_out, x_input_copy, w->rms_final_weight, dim);
+//         rmsnorm_vx(x, x_input_copy, w->rms_final_weight, dim);
+//         compare_results("rmsnorm_final", cpu_out, x, dim);
+//         free(cpu_out);
+//         free(x_input_copy);
+//     } else if (g_enable_timing_analysis) {
+//         start_us = time_in_us();
+//         rmsnorm_vx(x, x, w->rms_final_weight, dim);
+//         end_us = time_in_us();
+//         pos_op_time_us[OP_RMSNORM_FINAL] = (end_us - start_us);
+//     } else {
+//         rmsnorm(x, x, w->rms_final_weight, dim);
+//     }
+
+//     // Classifier into logits
+//     if (g_enable_comparison) {
+//         float* cpu_logits = malloc(p->vocab_size * sizeof(float));
+//         printf("[P%d] Comparing MatMul (Classifier)...\n", pos);
+//         matmul(cpu_logits, x, w->wcls, p->dim, p->vocab_size);
+//         matmul_vx(s->logits, x, w->wcls, p->dim, p->vocab_size);
+//         compare_results("matmul_classifier", cpu_logits, s->logits, p->vocab_size);
+//         free(cpu_logits);
+//     } else if (g_enable_timing_analysis) {
+//         start_us = time_in_us();
+//         matmul_vx(s->logits, x, w->wcls, p->dim, p->vocab_size);
+//         end_us = time_in_us();
+//         pos_op_time_us[OP_MATMUL_CLS] = (end_us - start_us);
+//     } else {
+//         matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+//     }
+
+//     // --- 开始：打印性能分析报告 ---
+//     if (g_enable_timing_analysis) {
+//         long long total_pos_time_us = 0;
+//         for (int i = 0; i < NUM_OPS; i++) {
+//             total_pos_time_us += pos_op_time_us[i];
+//         }
+
+//         // 使用 ANSI escape code 让输出更醒目
+//         printf("\n\033[1;33m--- Timing Analysis for Position %d ---\033[0m\n", pos);
+//         printf("\033[1;33m--------------------------------------------------------\033[0m\n");
+//         printf("\033[1;33m%-24s | %12s | %s\033[0m\n", "Operator", "Time (us)", "Percentage");
+//         printf("\033[1;33m--------------------------------------------------------\033[0m\n");
+
+//         for (int i = 0; i < NUM_OPS; i++) {
+//             if (pos_op_time_us[i] > 0) { // 只打印运行了的算子
+//                 double percentage = (total_pos_time_us > 0) ? ((double)pos_op_time_us[i] / total_pos_time_us * 100.0) : 0.0;
+//                 printf("%-24s | %12lld | %9.2f%%\n", op_names[i], pos_op_time_us[i], percentage);
+//             }
+//         }
+//         printf("--------------------------------------------------------\n");
+//         printf("\033[1;33m%-24s | %12lld | %9.2f%%\033[0m\n", "Total Position Time", total_pos_time_us, 100.0);
+//         printf("\033[1;33m--------------------------------------------------------\033[0m\n\n");
+//         fflush(stdout);
+//     }
+//     // --- 结束：打印性能分析报告 ---
+
+//     return s->logits;
+// }
+
+// float* forward(Transformer* transformer, int token, int pos) {
+
+//     // a few convenience variables
+//     Config* p = &transformer->config;
+//     TransformerWeights* w = &transformer->weights;
+//     RunState* s = &transformer->state;
+//     float *x = s->x;
+//     int dim = p->dim;
+//     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+//     int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
+//     int hidden_dim =  p->hidden_dim;
+//     int head_size = dim / p->n_heads;
+
+//     // copy the token embedding into x
+//     float* content_row = w->token_embedding_table + token * dim;
+//     memcpy(x, content_row, dim*sizeof(*x));
+
+//     // forward all the layers
+//     for(unsigned long long l = 0; l < p->n_layers; l++) {
+
+//         // attention rmsnorm
+//         // rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+
+//         // Attention rmsnorm
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("\n[L%llu P%d] Comparing RMSNorm (Attention)...\n", l, pos);
+//             rmsnorm(cpu_out, x, w->rms_att_weight + l*dim, dim);
+//             rmsnorm_vx(s->xb, x, w->rms_att_weight + l*dim, dim);
+//             compare_results("rmsnorm_att", cpu_out, s->xb, dim);
+//             free(cpu_out);
+//         } else {
+//             rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+//         }
+
+//         // key and value point to the kv cache
+//         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
+//         s->k = s->key_cache + loff + pos * kv_dim;
+//         s->v = s->value_cache + loff + pos * kv_dim;
+
+//         // QKV matmuls for this position
+//         if (g_enable_comparison) {
+//             float* cpu_q = malloc(dim * sizeof(float));
+//             float* cpu_k = malloc(kv_dim * sizeof(float));
+//             float* cpu_v = malloc(kv_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (Q, K, V)...\n", l, pos);
+//             // Q
+//             matmul(cpu_q, s->xb, w->wq + l*dim*dim, dim, dim);
+//             matmul_vx(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+//             compare_results("matmul_q", cpu_q, s->q, dim);
+//             // K
+//             matmul(cpu_k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+//             matmul_vx(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+//             compare_results("matmul_k", cpu_k, s->k, kv_dim);
+//             // V
+//             matmul(cpu_v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+//             matmul_vx(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+//             compare_results("matmul_v", cpu_v, s->v, kv_dim);
+//             free(cpu_q); free(cpu_k); free(cpu_v);
+//         } else {
+//             matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+//             matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+//             matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+//         }
+
+//         // RoPE relative positional encoding (in-place)
+//         if (g_enable_comparison) {
+//             float* cpu_q = malloc(dim * sizeof(float));
+//             float* cpu_k = malloc(kv_dim * sizeof(float));
+//             memcpy(cpu_q, s->q, dim * sizeof(float));
+//             memcpy(cpu_k, s->k, kv_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing RoPE...\n", l, pos);
+//             rope_encoding(dim, kv_dim, head_size, pos, cpu_q, cpu_k);
+//             rope_encoding_vx(dim, kv_dim, head_size, pos, s->q, s->k);
+//             compare_results("rope_q", cpu_q, s->q, dim);
+//             compare_results("rope_k", cpu_k, s->k, kv_dim);
+//             free(cpu_q); free(cpu_k);
+//         } else {
+//             rope_encoding(dim, kv_dim, head_size, pos, s->q, s->k);
+//         }
+
+
+//         // Multihead attention (in-place for sxb and satt)
+//         if (g_enable_comparison) {
+//             float* cpu_xb = malloc(dim * sizeof(float));
+//             float* cpu_att = malloc(p->n_heads * p->seq_len * sizeof(float));
+//             memcpy(cpu_xb, s->xb, dim * sizeof(float));
+//             memcpy(cpu_att, s->att, p->n_heads * p->seq_len * sizeof(float));
+//             printf("[L%llu P%d] Comparing Multi-Head Attention...\n", l, pos);
+
+//             multihead_attention(cpu_xb, s->q, s->k, s->v, cpu_att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+//             multihead_attention_vx(s->xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+            
+//             compare_results("multihead_attention_xb", cpu_xb, s->xb, dim);
+//             free(cpu_xb);
+//             free(cpu_att);
+//         } else {
+//             multihead_attention(s->xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+//         }
+
+//         // Final matmul to get the output of the attention
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (WO)...\n", l, pos);
+//             matmul(cpu_out, s->xb, w->wo + l*dim*dim, dim, dim);
+//             matmul_vx(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+//             compare_results("matmul_wo", cpu_out, s->xb2, dim);
+//             free(cpu_out);
+//         } else {
+//             matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+//         }
+
+//         // Residual connection back into x (in-place)
+//         if (g_enable_comparison) {
+//             float* cpu_x = malloc(dim * sizeof(float));
+//             memcpy(cpu_x, x, dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing Accum (Attention)...\n", l, pos);
+//             accum(cpu_x, s->xb2, dim);
+//             accum_vx(x, s->xb2, dim);
+//             compare_results("accum_att", cpu_x, x, dim);
+//             free(cpu_x);
+//         } else {
+//             accum(x, s->xb2, dim);
+//         }
+
+//         // FFN rmsnorm
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing RMSNorm (FFN)...\n", l, pos);
+//             rmsnorm(cpu_out, x, w->rms_ffn_weight + l*dim, dim);
+//             rmsnorm_vx(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+//             compare_results("rmsnorm_ffn", cpu_out, s->xb, dim);
+//             free(cpu_out);
+//         } else {
+//             rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+//         }
+        
+//         // FFN matmuls (w1, w3)
+//         if (g_enable_comparison) {
+//             float* cpu_hb = malloc(hidden_dim * sizeof(float));
+//             float* cpu_hb2 = malloc(hidden_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (W1, W3)...\n", l, pos);
+//             matmul(cpu_hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+//             matmul_vx(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+//             compare_results("matmul_w1", cpu_hb, s->hb, hidden_dim);
+            
+//             matmul(cpu_hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+//             matmul_vx(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+//             compare_results("matmul_w3", cpu_hb2, s->hb2, hidden_dim);
+            
+//             free(cpu_hb); free(cpu_hb2);
+//         } else {
+//             matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+//             matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+//         }
+
+//         // SwiGLU non-linearity (in-place for hb)
+//         if (g_enable_comparison) {
+//             float* cpu_hb = malloc(hidden_dim * sizeof(float));
+//             memcpy(cpu_hb, s->hb, hidden_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing SwiGLU...\n", l, pos);
+//             swiglu(cpu_hb, s->hb2, hidden_dim);
+//             swiglu_vx(s->hb, s->hb2, hidden_dim);
+//             compare_results("swiglu", cpu_hb, s->hb, hidden_dim);
+//             free(cpu_hb);
+//         } else {
+//             swiglu(s->hb, s->hb2, hidden_dim);
+//         }
+
+//         // Final matmul to get the output of the ffn
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (W2)...\n", l, pos);
+//             matmul(cpu_out, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+//             matmul_vx(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+//             compare_results("matmul_w2", cpu_out, s->xb, dim);
+//             free(cpu_out);
+//         } else {
+//             matmul(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+//         }
+
+
+//         // Residual connection (in-place)
+//         if (g_enable_comparison) {
+//             float* cpu_x = malloc(dim * sizeof(float));
+//             memcpy(cpu_x, x, dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing Accum (FFN)...\n", l, pos);
+//             accum(cpu_x, s->xb, dim);
+//             accum_vx(x, s->xb, dim);
+//             compare_results("accum_ffn", cpu_x, x, dim);
+//             free(cpu_x);
+//         } else {
+//             accum(x, s->xb, dim);
+//         }
+//     }
+
+//     // Final rmsnorm (in-place)
+//     if (g_enable_comparison) {
+//         float* cpu_out = malloc(dim * sizeof(float));
+//         float* x_input_copy = malloc(dim * sizeof(float));
+//         memcpy(x_input_copy, x, dim * sizeof(float));
+        
+//         printf("[P%d] Comparing RMSNorm (Final)...\n", pos);
+//         rmsnorm(cpu_out, x_input_copy, w->rms_final_weight, dim);
+//         rmsnorm_vx(x, x_input_copy, w->rms_final_weight, dim);
+        
+//         compare_results("rmsnorm_final", cpu_out, x, dim);
+//         free(cpu_out);
+//         free(x_input_copy);
+//     } else {
+//         rmsnorm(x, x, w->rms_final_weight, dim);
+//     }
+
+//     // Classifier into logits
+//     if (g_enable_comparison) {
+//         float* cpu_logits = malloc(p->vocab_size * sizeof(float));
+//         printf("[P%d] Comparing MatMul (Classifier)...\n", pos);
+//         matmul(cpu_logits, x, w->wcls, p->dim, p->vocab_size);
+//         matmul_vx(s->logits, x, w->wcls, p->dim, p->vocab_size);
+//         compare_results("matmul_classifier", cpu_logits, s->logits, p->vocab_size);
+//         free(cpu_logits);
+//     } else {
+//         matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+//     }
+
+//     return s->logits;
+// }
 
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
@@ -915,7 +1782,14 @@ void safe_printf(char *piece) {
             return; // bad byte, don't print it
         }
     }
-    printf("%s", piece);
+    
+    // 如果启用了对比模式，让正常输出更醒目
+    if (g_enable_comparison) {
+        // 使用绿色粗体显示正常文本输出
+        printf("\033[1;32m%s\033[0m", piece);
+    } else {
+        printf("%s", piece);
+    }
 }
 
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
@@ -1215,6 +2089,14 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         exit(EXIT_FAILURE);
     }
 
+    // 如果启用对比模式，添加醒目的开始标识
+    if (g_enable_comparison) {
+        printf("\n\033[1;36m================================================================================\033[0m\n");
+        printf("\033[1;36m🚀 开始文本生成 (对比模式已启用)\033[0m\n");
+        printf("\033[1;36m💡 绿色粗体文字为AI生成的内容\033[0m\n");
+        printf("\033[1;36m================================================================================\033[0m\n\n");
+    }
+
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
@@ -1240,14 +2122,22 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
         // print the token as string, decode it with the Tokenizer object
         char* piece = decode(tokenizer, token, next);
-        safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        safe_printf(piece); // 现在会根据对比模式显示醒目的输出
         fflush(stdout);
         token = next;
 
         // init the timer here because the first iteration can be slower
         if (start == 0) { start = time_in_ms(); }
     }
-    printf("\n");
+    
+    // 如果启用对比模式，添加醒目的结束标识
+    if (g_enable_comparison) {
+        printf("\n\n\033[1;36m================================================================================\033[0m\n");
+        printf("\033[1;36m✅ 文本生成完成\033[0m\n");
+        printf("\033[1;36m================================================================================\033[0m\n");
+    } else {
+        printf("\n");
+    }
 
     // report achieved tok/s (pos-1 because the timer starts after first iteration)
     if (pos > 1) {
@@ -1286,6 +2176,14 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     int num_prompt_tokens = 0;
     int* prompt_tokens = (int*)malloc(1152 * sizeof(int));
     int user_idx;
+
+    // 如果启用对比模式，添加聊天模式的醒目标识
+    if (g_enable_comparison) {
+        printf("\n\033[1;35m================================================================================\033[0m\n");
+        printf("\033[1;35m💬 聊天模式 (对比模式已启用)\033[0m\n");
+        printf("\033[1;35m💡 Assistant回复将以绿色粗体显示\033[0m\n");
+        printf("\033[1;35m================================================================================\033[0m\n\n");
+    }
 
     // start the main loop
     int8_t user_turn = 1; // user starts
@@ -1328,7 +2226,13 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
             encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
             user_idx = 0; // reset the user index
             user_turn = 0;
-            printf("Assistant: ");
+            
+            // 为Assistant回复添加醒目标识
+            if (g_enable_comparison) {
+                printf("\033[1;34mAssistant: \033[0m");
+            } else {
+                printf("Assistant: ");
+            }
         }
 
         // determine the token to pass into the transformer next
@@ -1350,7 +2254,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
         if (user_idx >= num_prompt_tokens && next != 2) {
             // the Assistant is responding, so print its output
             char* piece = decode(tokenizer, token, next);
-            safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+            safe_printf(piece); // 现在会根据对比模式显示醒目的输出
             fflush(stdout);
         }
         if (next == 2) { printf("\n"); }
@@ -1358,7 +2262,6 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     printf("\n");
     free(prompt_tokens);
 }
-
 
 // ----------------------------------------------------------------------------
 // CLI, include only if not testing
@@ -1376,6 +2279,8 @@ void error_usage() {
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+    fprintf(stderr, "  -c          enable comparison between CPU and Vortex GPGPU results\n");
+    fprintf(stderr, "  -a          enable timing analysis for Vortex GPGPU operators\n"); 
     exit(EXIT_FAILURE);
 }
 
@@ -1392,24 +2297,51 @@ int main(int argc, char *argv[]) {
     char *mode = "generate";    // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
-    // poor man's C argparse so we can override the defaults above from the command line
-    if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
-    for (int i = 2; i < argc; i+=2) {
-        // do some basic validation
-        if (i + 1 >= argc) { error_usage(); } // must have arg after flag
-        if (argv[i][0] != '-') { error_usage(); } // must start with dash
-        if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
-        // read in the args
-        if (argv[i][1] == 't') { temperature = atof(argv[i + 1]); }
-        else if (argv[i][1] == 'p') { topp = atof(argv[i + 1]); }
-        else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
-        else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); }
-        else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
-        else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
-        else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
-        else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
-        else { error_usage(); }
+        // Argument parsing
+    if (argc < 2) {
+        error_usage();
     }
+
+    checkpoint_path = argv[1];
+
+   
+    for (int i = 2; i < argc; i++) {
+        if (argv[i][0] != '-') { error_usage(); }
+        
+        char flag = argv[i][1];
+        
+        // --- 开始：修改命令行解析逻辑 ---
+        if (flag == 'c') {
+            g_enable_comparison = true;
+            g_enable_timing_analysis = false; // 与分析模式互斥
+            continue; // 无需参数
+        }
+        if (flag == 'a') { // 新增的分析模式标志
+            g_enable_timing_analysis = true;
+            g_enable_comparison = false; // 与对比模式互斥
+            printf("Timing analysis mode enabled. Will run on Vortex GPGPU.\n");
+            continue; // 无需参数
+        }
+        // --- 结束：修改命令行解析逻辑 ---
+
+        // For flags with arguments, check if argument exists
+        if (i + 1 >= argc) { error_usage(); }
+        
+        char *arg = argv[i + 1];
+        
+        if (flag == 't') { temperature = atof(arg); }
+        else if (flag == 'p') { topp = atof(arg); }
+        else if (flag == 's') { rng_seed = atoi(arg); }
+        else if (flag == 'n') { steps = atoi(arg); }
+        else if (flag == 'i') { prompt = arg; }
+        else if (flag == 'z') { tokenizer_path = arg; }
+        else if (flag == 'm') { mode = arg; }
+        else if (flag == 'y') { system_prompt = arg; }
+        else { error_usage(); }
+        
+        i++; // Increment i to skip the argument
+    }
+
 
     // parameter validation/overrides
     if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
