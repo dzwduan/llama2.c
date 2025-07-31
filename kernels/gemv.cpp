@@ -10,7 +10,7 @@ void kernel(gemv_arg_t *arg) {
   auto xout = reinterpret_cast<float *>(arg->xout_addr);
   auto size = arg->n;
 
-  int row = blockIdx.y;
+  int row = blockIdx.x;
 
   float sum(0.0f);
   for (int e = 0; e < size; ++e)
@@ -21,7 +21,7 @@ void kernel(gemv_arg_t *arg) {
 
 int main() {
   auto *arg = (gemv_arg_t *)csr_read(VX_CSR_MSCRATCH);
-  uint32_t grid_dim[2] = {1, arg->d};
+  uint32_t grid_dim[2] = {arg->d};
 
-  return vx_spawn_threads(2, grid_dim, nullptr, (vx_kernel_func_cb)kernel, arg);
+  return vx_spawn_threads(1, grid_dim, nullptr, (vx_kernel_func_cb)kernel, arg);
 }
