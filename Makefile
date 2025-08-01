@@ -1,3 +1,4 @@
+include config.mk
 # choose your compiler, e.g. gcc/clang
 # example override to clang: make run CC=clang
 CC = gcc
@@ -25,6 +26,10 @@ run: run.c
 rundebug: run.c
 	$(CC) -g -O2 -o run run.c -lm $(CFLAGS) $(LDFLAGS)
 	$(CC) -g -O2 -o runq runq.c -lm $(CFLAGS) $(LDFLAGS)
+
+runperf: run.c
+	$(CC) -O3 -o run run.c -lm $(CFLAGS) $(LDFLAGS)
+	$(CC) -O3 -o runq runq.c -lm $(CFLAGS) $(LDFLAGS)
 
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 # https://simonbyrne.github.io/notes/fastmath/
@@ -86,22 +91,34 @@ testcc:
 clean:
 	rm -f run
 	rm -f runq
+	rm -rf trace
+	rm -rf kernel/build
 
 
 .PHONY: build_kernels
 build_kernels:
-	@echo "\033[1;32m====== BUILDING KERNELS =======\033[0m"
-	@$(MAKE) -C kernels VORTEX_KN_PATH=$(VORTEX_KN_PATH) VORTEX_HOME=$(VORTEX_HOME) VORTEX_BUILD_DIR=$(VORTEX_BUILD_DIR)
-	@echo "\033[1;32m====== KERNELS BUILT =======\033[0m"
+ifeq "$(MODE)" "DEBUG"
+	@echo "\033[1;32m====== BUILDING KERNELS (DEBUG) =======\033[0m"
+	$(MAKE) -C kernels VORTEX_KN_PATH=$(VORTEX_KN_PATH) VORTEX_HOME=$(VORTEX_HOME) VORTEX_BUILD_DIR=$(VORTEX_BUILD_DIR) MODE=$(MODE)
+	@echo "\033[1;32m====== KERNELS BUILT (DEBUG) =======\033[0m"
+else ifeq "$(MODE)" "PERF"
+	@echo "\033[1;32m====== BUILDING KERNELS (PERF) =======\033[0m"
+	$(MAKE) -C kernels VORTEX_KN_PATH=$(VORTEX_KN_PATH) VORTEX_HOME=$(VORTEX_HOME) VORTEX_BUILD_DIR=$(VORTEX_BUILD_DIR) MODE=$(MODE)
+	@echo "\033[1;32m====== KERNELS BUILT (PERF) =======\033[0m"
+else
+	@echo "\033[1;31m====== ERROR: Unknown MODE=$(MODE). Valid values: DEBUG, PERF =======\033[0m"
+	@exit 1
+endif
+
 
 .PHONY: run-vortex
-run-vortex: rundebug build_kernels
-	@echo "\033[1;32m====== RUNNING =======\033[0m"
-	@LD_LIBRARY_PATH=$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=simx ./run stories15M.bin -c -n 32 -i "HelloWorld!" -s 256
-	@echo "\033[1;32m====== FINISHED ======\033[0m"
-
-.PHONY: run-vortex-perf
-run-vortex-perf: rundebug build_kernels
-	@echo "\033[1;32m====== RUNNING =======\033[0m"
-	@LD_LIBRARY_PATH=$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=simx ./run stories15M.bin -a -n 32 -i "HelloWorld!" -s 256
-	@echo "\033[1;32m====== FINISHED ======\033[0m"
+run-vortex: rundebug runperf build_kernels
+	@echo "\033[1;32m====== RUNNING VORTEX =======\033[0m"
+ifeq "$(MODE)" "DEBUG"
+	LD_LIBRARY_PATH=$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_DRIVER=simx ./run stories15M.bin -c -n 32 -i "HelloWorld!" -s 256
+else ifeq "$(MODE)" "PERF"
+	LD_LIBRARY_PATH=$(VORTEX_RT_PATH):$(LD_LIBRARY_PATH) VORTEX_PROFILING=1 VORTEX_DRIVER=simx ./run stories15M.bin -a -n 32 -i "HelloWorld!" -s 256
+else
+	@echo "\033[1;31m====== ERROR: Unknown MODE=$(MODE). Valid values: DEBUG, PERF =======\033[0m"
+	@exit 1
+endif

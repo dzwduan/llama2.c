@@ -8,12 +8,9 @@
 #include <string.h>
 #include <fcntl.h>
 #include <stdbool.h>
-#if defined _WIN32
-    #include "win.h"
-#else
-    #include <unistd.h>
-    #include <sys/mman.h>
-#endif
+#include <unistd.h>
+#include <sys/mman.h>
+
 
 #include "vortex.h"
 #include "kernels/kernels.h"

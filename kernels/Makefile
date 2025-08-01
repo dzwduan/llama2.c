@@ -22,7 +22,14 @@ VX_CP  = $(VORTEX_LLVM)/bin/llvm-objcopy
 VX_CFLAGS += -O3 -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -nostdlib -fdata-sections -ffunction-sections -std=c++20
 VX_CFLAGS += -I$(VORTEX_HOME)/kernel/include -I$(VORTEX_BUILD_DIR)/hw
 VX_CFLAGS += -DXLEN_64
-VX_CFLAGS += -DNDEBUG
+
+ifeq "$(MODE)" "DEBUG"
+	VX_CFLAGS += -DNDEBUG
+else ifeq "$(MODE)" "PERF"
+	VX_CFLAGS += -DPERF_ENABLE=1
+else
+	# 默认情况下不添加额外标志
+endif
 
 VX_CFLAGS += -march=rv64imafd -mabi=lp64d
 STARTUP_ADDR ?= 0x180000000
