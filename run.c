@@ -11,7 +11,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 
-
+#include <stdio.h>
 #include "vortex.h"
 #include "kernels/kernels.h"
 #include "perf.h"
@@ -21,7 +21,7 @@ static bool g_enable_comparison = false;
 // 用于启用性能分析的全局标志
 static bool g_enable_timing_analysis = false;
 
-
+typedef uint64_t vx_addr_h;
 
 // ----------------------------------------------------------------------------
 // Vortex
@@ -53,8 +53,8 @@ static vx_buffer_h vx_rmsnorm_buf = NULL;
 static const char *vx_rope_kernel = "./kernels/build/rope.vxbin";
 static vx_buffer_h vx_rope_buf = NULL;
 
-static const char *vx_softmax_kernel = "./kernels/build/softmax.vxbin";
-static vx_buffer_h vx_softmax_buf = NULL;
+// static const char *vx_softmax_kernel = "./kernels/build/softmax.vxbin";
+// static vx_buffer_h vx_softmax_buf = NULL;
 
 static const char *vx_accum_kernel = "./kernels/build/accum.vxbin";
 static vx_buffer_h vx_accum_buf = NULL;
@@ -107,6 +107,20 @@ typedef struct {
     float* rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
     float* wcls;
+
+    // TODO: refactor this to use a more generic way of handling vortex weights
+    vx_addr_h token_embedding_table_vx;
+    vx_addr_h rms_att_weight_vx;
+    vx_addr_h wq_vx;
+    vx_addr_h wk_vx;
+    vx_addr_h wv_vx;
+    vx_addr_h wo_vx;
+    vx_addr_h rms_ffn_weight_vx;
+    vx_addr_h w1_vx;
+    vx_addr_h w2_vx;
+    vx_addr_h w3_vx;
+    vx_addr_h rms_final_weight_vx;
+    vx_addr_h wcls_vx;
 } TransformerWeights;
 
 typedef struct {
@@ -124,6 +138,41 @@ typedef struct {
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
+
+
+    // For vortex
+    vx_buffer_h x_vx_buf;
+    vx_addr_h x_vx;
+
+    vx_buffer_h xb_vx_buf;
+    vx_addr_h xb_vx;
+
+    vx_buffer_h xb2_vx_buf;
+    vx_addr_h xb2_vx;
+
+    vx_buffer_h hb_vx_buf;
+    vx_addr_h hb_vx;
+
+    vx_buffer_h hb2_vx_buf;
+    vx_addr_h hb2_vx;
+
+    vx_buffer_h q_vx_buf;
+    vx_addr_h q_vx;
+
+    vx_addr_h k_vx;
+    vx_addr_h v_vx;
+
+    vx_buffer_h att_vx_buf;
+    vx_addr_h att_vx;
+
+    vx_buffer_h logits_vx_buf;
+    vx_addr_h logits_vx;
+
+    vx_buffer_h key_cache_vx_buf;
+    vx_addr_h key_cache_vx;
+
+    vx_buffer_h value_cache_vx_buf;
+    vx_addr_h value_cache_vx;
 } RunState;
 
 typedef struct {
@@ -186,6 +235,26 @@ void malloc_run_state(RunState* s, Config* p) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
+
+#define MALLOC_VORTEX_STATE(name, size)                                        \
+    RT_CHECK(                                                                  \
+        vx_mem_alloc(device, size, VX_MEM_READ_WRITE, &s->name##_vx_buf));     \
+    RT_CHECK(vx_mem_address(s->name##_vx_buf, &s->name##_vx));
+
+    MALLOC_VORTEX_STATE(x, p->dim * sizeof(float));
+    MALLOC_VORTEX_STATE(xb, p->dim * sizeof(float));
+    MALLOC_VORTEX_STATE(xb2, p->dim * sizeof(float));
+    MALLOC_VORTEX_STATE(hb, p->hidden_dim * sizeof(float));
+    MALLOC_VORTEX_STATE(hb2, p->hidden_dim * sizeof(float));
+    MALLOC_VORTEX_STATE(q, p->dim * sizeof(float));
+    MALLOC_VORTEX_STATE(key_cache,
+                        p->n_layers * p->seq_len * kv_dim * sizeof(float));
+    MALLOC_VORTEX_STATE(value_cache,
+                        p->n_layers * p->seq_len * kv_dim * sizeof(float));
+    MALLOC_VORTEX_STATE(att, p->n_heads * p->seq_len * sizeof(float));
+    MALLOC_VORTEX_STATE(logits, p->vocab_size * sizeof(float));
+
+#undef MALLOC_VORTEX_STATE
 }
 
 void free_run_state(RunState* s) {
@@ -199,6 +268,17 @@ void free_run_state(RunState* s) {
     free(s->logits);
     free(s->key_cache);
     free(s->value_cache);
+
+    RT_CHECK(vx_mem_free(s->x_vx_buf));
+    RT_CHECK(vx_mem_free(s->xb_vx_buf));
+    RT_CHECK(vx_mem_free(s->xb2_vx_buf));
+    RT_CHECK(vx_mem_free(s->hb_vx_buf));
+    RT_CHECK(vx_mem_free(s->hb2_vx_buf));
+    RT_CHECK(vx_mem_free(s->q_vx_buf));
+    RT_CHECK(vx_mem_free(s->att_vx_buf));
+    RT_CHECK(vx_mem_free(s->logits_vx_buf));
+    RT_CHECK(vx_mem_free(s->key_cache_vx_buf));
+    RT_CHECK(vx_mem_free(s->value_cache_vx_buf));
 }
 
 void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
@@ -232,6 +312,52 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
+void memory_map_weights_vx(TransformerWeights *w, Config *p, vx_addr_h ptr,
+                           int shared_weights) {
+  (void)shared_weights;
+  int head_size = p->dim / p->n_heads;
+
+  size_t n_layers = p->n_layers;
+  w->token_embedding_table_vx = ptr;
+
+  ptr += p->vocab_size * p->dim * sizeof(float);
+  w->rms_att_weight_vx = ptr;
+
+  ptr += n_layers * p->dim * sizeof(float);
+  w->wq_vx = ptr;
+
+  ptr += n_layers * p->dim * (p->n_heads * head_size) * sizeof(float);
+  w->wk_vx = ptr;
+
+  ptr += n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float);
+  w->wv_vx = ptr;
+
+  ptr += n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float);
+  w->wo_vx = ptr;
+
+  ptr += n_layers * (p->n_heads * head_size) * p->dim * sizeof(float);
+  w->rms_ffn_weight_vx = ptr;
+
+  ptr += n_layers * p->dim * sizeof(float);
+  w->w1_vx = ptr;
+
+  ptr += n_layers * p->dim * p->hidden_dim * sizeof(float);
+  w->w2_vx = ptr;
+
+  ptr += n_layers * p->hidden_dim * p->dim * sizeof(float);
+  w->w3_vx = ptr;
+
+  ptr += n_layers * p->dim * p->hidden_dim * sizeof(float);
+  w->rms_final_weight_vx = ptr;
+
+  ptr += p->dim * sizeof(float);
+  ptr += p->seq_len * head_size / 2 *
+         sizeof(float); // skip what used to be freq_cis_real (for RoPE)
+  ptr += p->seq_len * head_size / 2 *
+         sizeof(float); // skip what used to be freq_cis_imag (for RoPE)
+  w->wcls_vx = shared_weights ? w->token_embedding_table_vx : ptr;
+}
+
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
                      int* fd, float** data, ssize_t* file_size) {
     FILE *file = fopen(checkpoint, "rb");
@@ -252,6 +378,17 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
+
+    // vortex memory map the Transformer weights
+    size_t weights_size = *file_size - sizeof(Config);
+    vx_buffer_h weights_buf = NULL;
+    vx_addr_h weights_vx_ptr = 0;
+
+    RT_CHECK(
+        vx_mem_alloc(device, weights_size, VX_MEM_READ_WRITE, &weights_buf));
+    RT_CHECK(vx_copy_to_dev(weights_buf, weights_ptr, 0, weights_size));
+    RT_CHECK(vx_mem_address(weights_buf, &weights_vx_ptr));
+    memory_map_weights_vx(weights, config, weights_vx_ptr, shared_weights);
 }
 
 void build_transformer(Transformer *t, char* checkpoint_path) {
@@ -289,10 +426,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
 
 int divUp(int a, int b) { return (a - 1) / b + 1; }
 
-void rmsnorm_vx(float *o, float *x, float *weight, int size) {
-  vx_buffer_h o_buf = NULL;
-  vx_buffer_h x_buf = NULL;
-  vx_buffer_h w_buf = NULL;
+void rmsnorm_vx(vx_addr_h o, vx_addr_h x, vx_addr_h weight, int size) {
   rmsnorm_arg_t args = {};
 
   uint64_t num_cores, num_warps, num_threads;
@@ -300,29 +434,11 @@ void rmsnorm_vx(float *o, float *x, float *weight, int size) {
   RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_WARPS, &num_warps));
   RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &num_threads));
 
-  // Allocate buffers
-  // o (size,) size: size * sizeof(float)
-  size_t o_size = size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, o_size, VX_MEM_READ_WRITE, &o_buf));
-  RT_CHECK(vx_mem_address(o_buf, &args.o_addr));
-
-  // x (size,) size: size * sizeof(float)
-  size_t x_size = size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, x_size, VX_MEM_READ, &x_buf));
-  RT_CHECK(vx_mem_address(x_buf, &args.x_addr));
-
-  // weight (size,) size: size * sizeof(float)
-  size_t w_size = size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, w_size, VX_MEM_READ, &w_buf));
-  RT_CHECK(vx_mem_address(w_buf, &args.w_addr));
-
-  // Upload x to device
-  RT_CHECK(vx_copy_to_dev(x_buf, x, 0, x_size));
-  // Upload weight to device
-  RT_CHECK(vx_copy_to_dev(w_buf, weight, 0, w_size));
-
   // Upload kernel arguments
   args.size = size;
+  args.o_addr = o;
+  args.x_addr = x;
+  args.w_addr = weight;
 
   int total_threads = num_warps * num_threads;
   args.elements_per_thread = divUp(size, total_threads);
@@ -336,15 +452,11 @@ void rmsnorm_vx(float *o, float *x, float *weight, int size) {
 
   // Start the kernel
   RT_CHECK(vx_start(device, vx_rmsnorm_buf, rmsnorm_args_buffer));
+
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(o, o_buf, 0, o_size));
 
   // Free the buffers
-  RT_CHECK(vx_mem_free(o_buf));
-  RT_CHECK(vx_mem_free(x_buf));
-  RT_CHECK(vx_mem_free(w_buf));
   RT_CHECK(vx_mem_free(rmsnorm_args_buffer));
   RT_CHECK(vx_mem_free(vx_rmsnorm_buf));
 }
@@ -369,61 +481,7 @@ void softmax(float* x, int size) {
     }
 }
 
-void softmax_vx(float *x, int size) {
-  vx_buffer_h x_buf = NULL;
-  vx_buffer_h global_reduce = NULL;
-  vx_buffer_h global_core_reduce = NULL;
-  softmax_arg_t args = {};
 
-  // Get device capabilities
-  uint64_t num_cores, num_warps, num_threads;
-  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_CORES, &num_cores));
-  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_WARPS, &num_warps));
-  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_THREADS, &num_threads));
-
-  // Allocate buffers
-  size_t x_size = size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, x_size, VX_MEM_READ_WRITE, &x_buf));
-  RT_CHECK(vx_mem_address(x_buf, &args.x_addr));
-
-  // Allocate global reduce buffer
-  RT_CHECK(
-      vx_mem_alloc(device, sizeof(float), VX_MEM_READ_WRITE, &global_reduce));
-  RT_CHECK(vx_mem_address(global_reduce, &args.global_reduce_addr));
-
-  // Allocate global core reduce buffer
-  RT_CHECK(vx_mem_alloc(device, sizeof(float), VX_MEM_READ_WRITE,
-                        &global_core_reduce));
-  RT_CHECK(vx_mem_address(global_core_reduce, &args.global_core_reduce_addr));
-
-  // Upload x to device
-  RT_CHECK(vx_copy_to_dev(x_buf, x, 0, x_size));
-
-  // Upload kernel arguments
-  args.size = size;
-
-  int total_threads = num_cores * num_warps * num_threads;
-  args.elements_per_thread = divUp(size, total_threads);
-
-  vx_buffer_h softmax_args_buffer;
-  RT_CHECK(vx_upload_bytes(device, &args, sizeof(softmax_arg_t),
-                           &softmax_args_buffer));
-
-  // Upload kernel
-  RT_CHECK(vx_upload_kernel_file(device, vx_softmax_kernel, &vx_softmax_buf));
-
-  // Start the kernel
-  RT_CHECK(vx_start(device, vx_softmax_buf, softmax_args_buffer));
-  RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
-
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(x, x_buf, 0, x_size));
-
-  // Free the buffers
-  RT_CHECK(vx_mem_free(x_buf));
-  RT_CHECK(vx_mem_free(softmax_args_buffer));
-  RT_CHECK(vx_mem_free(vx_softmax_buf));
-}
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
@@ -439,36 +497,15 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
-void matmul_vx(float *xout, float *x, float *w, int n, int d) {
-  vx_buffer_h xout_buf = NULL;
-  vx_buffer_h x_buf = NULL;
-  vx_buffer_h w_buf = NULL;
+void matmul_vx(vx_addr_h xout, vx_addr_h x, vx_addr_h w, int n, int d) {
   gemv_arg_t args = {};
-
-  // Allocate buffers
-  // xout (d,) size: d * sizeof(float)
-  size_t xout_size = d * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, xout_size, VX_MEM_WRITE, &xout_buf));
-  RT_CHECK(vx_mem_address(xout_buf, &args.xout_addr));
-
-  // x (n,) size: n * sizeof(float)
-  size_t x_size = n * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, x_size, VX_MEM_READ, &x_buf));
-  RT_CHECK(vx_mem_address(x_buf, &args.x_addr));
-
-  // w (d,n) size: d * n * sizeof(float)
-  size_t w_size = d * n * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, w_size, VX_MEM_READ, &w_buf));
-  RT_CHECK(vx_mem_address(w_buf, &args.w_addr));
-
-  // Upload x to device
-  RT_CHECK(vx_copy_to_dev(x_buf, x, 0, x_size));
-  // Upload w to device
-  RT_CHECK(vx_copy_to_dev(w_buf, w, 0, w_size));
 
   // Upload kernel arguments
   args.n = n;
   args.d = d;
+  args.w_addr = w;
+  args.x_addr = x;
+  args.xout_addr = xout;
 
   vx_buffer_h gemv_args_buffer;
   RT_CHECK(
@@ -481,13 +518,7 @@ void matmul_vx(float *xout, float *x, float *w, int n, int d) {
   RT_CHECK(vx_start(device, vx_gemv_buf, gemv_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(xout, xout_buf, 0, xout_size));
-
   // Free the buffers
-  RT_CHECK(vx_mem_free(xout_buf));
-  RT_CHECK(vx_mem_free(x_buf));
-  RT_CHECK(vx_mem_free(w_buf));
   RT_CHECK(vx_mem_free(gemv_args_buffer));
   RT_CHECK(vx_mem_free(vx_gemv_buf));
 }
@@ -511,33 +542,17 @@ void rope_encoding(int dim, int kv_dim, int head_size, float pos, float *q,
   }
 }
 
-void rope_encoding_vx(int dim, int kv_dim, int head_size, float pos, float *q,
-                      float *k) {
-  vx_buffer_h q_buf = NULL;
-  vx_buffer_h k_buf = NULL;
+void rope_encoding_vx(int dim, int kv_dim, int head_size, float pos,
+                      vx_addr_h q, vx_addr_h k) {
   rope_arg_t args = {};
-
-  // Allocate buffers
-  // q (dim,) size: dim * sizeof(float)
-  size_t q_size = dim * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, q_size, VX_MEM_READ_WRITE, &q_buf));
-  RT_CHECK(vx_mem_address(q_buf, &args.q_addr));
-
-  // k (dim,) size: dim * sizeof(float)
-  size_t k_size = dim * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, k_size, VX_MEM_READ_WRITE, &k_buf));
-  RT_CHECK(vx_mem_address(k_buf, &args.k_addr));
-
-  // Upload q to device
-  RT_CHECK(vx_copy_to_dev(q_buf, q, 0, q_size));
-  // Upload k to device
-  RT_CHECK(vx_copy_to_dev(k_buf, k, 0, k_size));
 
   // Upload kernel arguments
   args.dim = dim;
   args.head_size = head_size;
   args.kv_dim = kv_dim;
   args.pos = pos;
+  args.q_addr = q;
+  args.k_addr = k;
 
   vx_buffer_h rope_args_buffer;
   RT_CHECK(
@@ -550,16 +565,10 @@ void rope_encoding_vx(int dim, int kv_dim, int head_size, float pos, float *q,
   RT_CHECK(vx_start(device, vx_rope_buf, rope_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(q, q_buf, 0, q_size));
-  RT_CHECK(vx_copy_from_dev(k, k_buf, 0, k_size));
-
-  // Free the buffers
-  RT_CHECK(vx_mem_free(q_buf));
-  RT_CHECK(vx_mem_free(k_buf));
   RT_CHECK(vx_mem_free(rope_args_buffer));
   RT_CHECK(vx_mem_free(vx_rope_buf));
 }
+
 
 void multihead_attention(float *sxb, float *sq, float *sk, float *sv,
                          float *satt, float *key_cache, float *value_cache,
@@ -605,61 +614,14 @@ void multihead_attention(float *sxb, float *sq, float *sk, float *sv,
   }
 }
 
-void multihead_attention_vx(float *sxb, float *sq, float *sk, float *sv,
-                            float *satt, float *key_cache, float *value_cache,
-                            int n_heads, int seq_len, int head_size, int kv_dim,
-                            int kv_mul, int pos, int loff) {
-  vx_buffer_h sxb_buf = NULL;
-  vx_buffer_h sq_buf = NULL;
-  vx_buffer_h sk_buf = NULL;
-  vx_buffer_h sv_buf = NULL;
-  vx_buffer_h satt_buf = NULL;
-  vx_buffer_h key_cache_buf = NULL;
-  vx_buffer_h value_cache_buf = NULL;
-  attention_arg_t args = {};
-
-  // Allocate buffers
-  // sxb (dim,) size: n_heads * head_size * sizeof(float)
-  size_t sxb_size = n_heads * head_size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, sxb_size, VX_MEM_READ_WRITE, &sxb_buf));
-  RT_CHECK(vx_mem_address(sxb_buf, &args.sxb_addr));
-
-  // sq (dim,) size: n_heads * head_size * sizeof(float)
-  size_t sq_size = n_heads * head_size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, sq_size, VX_MEM_READ, &sq_buf));
-  RT_CHECK(vx_mem_address(sq_buf, &args.sq_addr));
-
+void multihead_attention_vx(vx_addr_h sxb, vx_addr_h sq, vx_addr_h sk,
+                            vx_addr_h sv, vx_addr_h satt, vx_addr_h key_cache,
+                            vx_addr_h value_cache, int n_heads, int seq_len,
+                            int head_size, int kv_dim, int kv_mul, int pos,
+                            int loff) {
   (void)sk;
   (void)sv;
-
-  // satt (n_heads, seq_len) size: n_heads * seq_len * sizeof(float)
-  size_t satt_size = n_heads * seq_len * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, satt_size, VX_MEM_READ_WRITE, &satt_buf));
-  RT_CHECK(vx_mem_address(satt_buf, &args.satt_addr));
-
-  // key_cache (n_layers, seq_len, kv_dim) size: n_layers * seq_len * kv_dim *
-  // sizeof(float)
-  size_t key_cache_size = n_heads * seq_len * kv_dim * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, key_cache_size, VX_MEM_READ, &key_cache_buf));
-  RT_CHECK(vx_mem_address(key_cache_buf, &args.key_cache_addr));
-
-  // value_cache (n_layers, seq_len, kv_dim) size: n_layers * seq_len * kv_dim *
-  // sizeof(float)
-  size_t value_cache_size = n_heads * seq_len * kv_dim * sizeof(float);
-  RT_CHECK(
-      vx_mem_alloc(device, value_cache_size, VX_MEM_READ, &value_cache_buf));
-  RT_CHECK(vx_mem_address(value_cache_buf, &args.value_cache_addr));
-
-  // Upload sxb to device
-  RT_CHECK(vx_copy_to_dev(sxb_buf, sxb, 0, sxb_size));
-  // Upload sq to device
-  RT_CHECK(vx_copy_to_dev(sq_buf, sq, 0, sq_size));
-  // Upload satt to device
-  RT_CHECK(vx_copy_to_dev(satt_buf, satt, 0, satt_size));
-  // Upload key_cache to device
-  RT_CHECK(vx_copy_to_dev(key_cache_buf, key_cache, 0, key_cache_size));
-  // Upload value_cache to device
-  RT_CHECK(vx_copy_to_dev(value_cache_buf, value_cache, 0, value_cache_size));
+  attention_arg_t args = {};
 
   // Upload kernel arguments
   args.n_heads = n_heads;
@@ -669,6 +631,11 @@ void multihead_attention_vx(float *sxb, float *sq, float *sk, float *sv,
   args.kv_mul = kv_mul;
   args.pos = pos;
   args.loff = loff;
+  args.sxb_addr = sxb;
+  args.sq_addr = sq;
+  args.satt_addr = satt;
+  args.key_cache_addr = key_cache;
+  args.value_cache_addr = value_cache;
 
   vx_buffer_h attention_args_buffer;
   RT_CHECK(vx_upload_bytes(device, &args, sizeof(attention_arg_t),
@@ -681,15 +648,7 @@ void multihead_attention_vx(float *sxb, float *sq, float *sk, float *sv,
   RT_CHECK(vx_start(device, vx_attention_buf, attention_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(sxb, sxb_buf, 0, sxb_size));
-  
   // Free the buffers
-  RT_CHECK(vx_mem_free(sxb_buf));
-  RT_CHECK(vx_mem_free(sq_buf));
-  RT_CHECK(vx_mem_free(satt_buf));
-  RT_CHECK(vx_mem_free(key_cache_buf));
-  RT_CHECK(vx_mem_free(value_cache_buf));
   RT_CHECK(vx_mem_free(attention_args_buffer));
   RT_CHECK(vx_mem_free(vx_attention_buf));
 }
@@ -701,29 +660,13 @@ void accum(float *a, float *b, int size) {
   }
 }
 
-void accum_vx(float *a, float *b, int size) {
-  vx_buffer_h a_buf = NULL;
-  vx_buffer_h b_buf = NULL;
+void accum_vx(vx_addr_h a, vx_addr_h b, int size) {
   accum_arg_t args = {};
-
-  // Allocate buffers
-  // a (size,) size: size * sizeof(float)
-  size_t a_size = size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, a_size, VX_MEM_READ_WRITE, &a_buf));
-  RT_CHECK(vx_mem_address(a_buf, &args.a_addr));
-
-  // b (size,) size: size * sizeof(float)
-  size_t b_size = size * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, b_size, VX_MEM_READ_WRITE, &b_buf));
-  RT_CHECK(vx_mem_address(b_buf, &args.b_addr));
-
-  // Upload b to device
-  RT_CHECK(vx_copy_to_dev(b_buf, b, 0, b_size));
-  // Upload a to device
-  RT_CHECK(vx_copy_to_dev(a_buf, a, 0, a_size));
 
   // Upload kernel arguments
   args.size = size;
+  args.a_addr = a;
+  args.b_addr = b;
 
   vx_buffer_h accum_args_buffer;
   RT_CHECK(
@@ -736,12 +679,6 @@ void accum_vx(float *a, float *b, int size) {
   RT_CHECK(vx_start(device, vx_accum_buf, accum_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(a, a_buf, 0, a_size));
-
-  // Free the buffers
-  RT_CHECK(vx_mem_free(a_buf));
-  RT_CHECK(vx_mem_free(b_buf));
   RT_CHECK(vx_mem_free(accum_args_buffer));
   RT_CHECK(vx_mem_free(vx_accum_buf));
 }
@@ -757,29 +694,13 @@ void swiglu(float *hb, float *hb2, int hidden_dim) {
   }
 }
 
-void swiglu_vx(float *hb, float *hb2, int hidden_dim) {
-  vx_buffer_h hb_buf = NULL;
-  vx_buffer_h hb2_buf = NULL;
+void swiglu_vx(vx_addr_h hb, vx_addr_h hb2, int hidden_dim) {
   swiglu_arg_t args = {};
-
-  // Allocate buffers
-  // hb (hidden_dim,) size: hidden_dim * sizeof(float)
-  size_t hb_size = hidden_dim * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, hb_size, VX_MEM_READ_WRITE, &hb_buf));
-  RT_CHECK(vx_mem_address(hb_buf, &args.hb_addr));
-
-  // hb2 (hidden_dim,) size: hidden_dim * sizeof(float)
-  size_t hb2_size = hidden_dim * sizeof(float);
-  RT_CHECK(vx_mem_alloc(device, hb2_size, VX_MEM_READ_WRITE, &hb2_buf));
-  RT_CHECK(vx_mem_address(hb2_buf, &args.hb2_addr));
-
-  // Upload hb to device
-  RT_CHECK(vx_copy_to_dev(hb_buf, hb, 0, hb_size));
-  // Upload hb2 to device
-  RT_CHECK(vx_copy_to_dev(hb2_buf, hb2, 0, hb2_size));
 
   // Upload kernel arguments
   args.hidden_dim = hidden_dim;
+  args.hb_addr = hb;
+  args.hb2_addr = hb2;
 
   vx_buffer_h swiglu_args_buffer;
   RT_CHECK(vx_upload_bytes(device, &args, sizeof(swiglu_arg_t),
@@ -792,19 +713,397 @@ void swiglu_vx(float *hb, float *hb2, int hidden_dim) {
   RT_CHECK(vx_start(device, vx_swiglu_buf, swiglu_args_buffer));
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  // Download the output
-  RT_CHECK(vx_copy_from_dev(hb, hb_buf, 0, hb_size));
-
-  // Free the buffers
-  RT_CHECK(vx_mem_free(hb_buf));
-  RT_CHECK(vx_mem_free(hb2_buf));
   RT_CHECK(vx_mem_free(swiglu_args_buffer));
   RT_CHECK(vx_mem_free(vx_swiglu_buf));
 }
 
+// float* forward(Transformer* transformer, int token, int pos) {
+
+//     // a few convenience variables
+//     Config* p = &transformer->config;
+//     TransformerWeights* w = &transformer->weights;
+//     RunState* s = &transformer->state;
+//     float *x = s->x;
+//     int dim = p->dim;
+//     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+//     int kv_mul = p->n_heads / p->n_kv_heads;
+//     int hidden_dim =  p->hidden_dim;
+//     int head_size = dim / p->n_heads;
+
+//     // --- Performance Analysis Variables ---
+//     PerfData pos_perf_data[NUM_OPS];
+//     if (g_enable_timing_analysis) {
+//         init_perf_data(pos_perf_data, NUM_OPS);
+//     }
+//     long long start_us, end_us;
+//     char dim_str_buffer[32];
+//     // --- End Performance Analysis Variables ---
+
+//     // copy the token embedding into x
+//     float *content_row = w->token_embedding_table + token * dim;
+
+//     vx_buffer_h x_buf = NULL;
+//     vx_addr_h x_vx = 0;
+//     RT_CHECK(
+//         vx_mem_alloc(device, dim * sizeof(float), VX_MEM_READ_WRITE, &x_buf));
+//     RT_CHECK(vx_mem_address(x_buf, &x_vx));
+//     RT_CHECK(vx_copy_to_dev(x_buf, content_row, 0, dim * sizeof(float)));
+
+
+//     // forward all the layers
+//     for(unsigned long long l = 0; l < p->n_layers; l++) {
+
+//         // Attention rmsnorm
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("\n[L%llu P%d] Comparing RMSNorm (Attention)...\n", l, pos);
+//             rmsnorm(cpu_out, x, w->rms_att_weight + l*dim, dim);
+//             printf("finished cpu rmsnorm\n");
+//                  rmsnorm_vx(s->xb_vx, x_vx, w->rms_att_weight_vx + l * dim * sizeof(float),
+//                  dim);
+//             printf("finished gpu rmsnorm\n");
+//             compare_results("rmsnorm_att", cpu_out, s->xb, dim);
+//             free(cpu_out);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             rmsnorm_vx(s->xb_vx, x_vx, w->rms_att_weight_vx + l*dim*sizeof(float), dim);
+//             end_us = time_in_us();
+//             record_perf(pos_perf_data, OP_RMSNORM_ATT, start_us, end_us, NULL);
+//         } else {
+//             rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+//         }
+
+//         // key and value point to the kv cache
+//         int loff = l * p->seq_len * kv_dim;
+//         s->k = s->key_cache + loff * sizeof(float) + pos * kv_dim * sizeof(float);
+//         s->v = s->value_cache + loff * sizeof(float) + pos * kv_dim * sizeof(float);
+
+//         // QKV matmuls for this position
+//         if (g_enable_comparison) {
+//             float* cpu_q = malloc(dim * sizeof(float));
+//             float* cpu_k = malloc(kv_dim * sizeof(float));
+//             float* cpu_v = malloc(kv_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (Q, K, V)...\n", l, pos);
+//             matmul(cpu_q, s->xb, w->wq + l*dim*dim, dim, dim);
+//             matmul_vx(s->q_vx, s->xb_vx, w->wq_vx + l*dim*dim*sizeof(float), dim, dim);
+//             compare_results("matmul_q", cpu_q, s->q, dim);
+
+//             matmul(cpu_k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+//             matmul_vx(s->k_vx, s->xb_vx, w->wk_vx + l*dim*kv_dim*sizeof(float), dim, kv_dim);
+//             compare_results("matmul_k", cpu_k, s->k, kv_dim);
+
+//             matmul(cpu_v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+//             matmul_vx(s->v_vx, s->xb_vx, w->wv_vx + l*dim*kv_dim*sizeof(float), dim, kv_dim);
+//             compare_results("matmul_v", cpu_v, s->v, kv_dim);
+
+//             free(cpu_q); free(cpu_k); free(cpu_v);
+//         } else if (g_enable_timing_analysis) {
+//             // Matmul Q
+//             start_us = time_in_us();
+//             matmul_vx(s->q_vx, s->xb_vx, w->wq_vx + l*dim*dim*sizeof(float), dim, dim);
+//             end_us = time_in_us();
+//             snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, dim);
+//             record_perf(pos_perf_data, OP_MATMUL_Q, start_us, end_us, dim_str_buffer);
+            
+//             // Matmul K
+//             start_us = time_in_us();
+//             matmul_vx(s->k_vx, s->xb_vx, w->wk_vx + l * dim * kv_dim * sizeof(float), dim, kv_dim);
+//             end_us = time_in_us();
+//             snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, kv_dim);
+//             record_perf(pos_perf_data, OP_MATMUL_K, start_us, end_us, dim_str_buffer);
+            
+//             // Matmul V
+//             start_us = time_in_us();
+//             matmul_vx(s->v_vx, s->xb_vx, w->wv_vx + l * dim * kv_dim * sizeof(float),dim, kv_dim);
+//             end_us = time_in_us();
+//             snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, kv_dim);
+//             record_perf(pos_perf_data, OP_MATMUL_V, start_us, end_us, dim_str_buffer);
+//         } else {
+//             matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+//             matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+//             matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+//         }
+
+//         // RoPE relative positional encoding
+//         if (g_enable_comparison) {
+//             float* cpu_q = malloc(dim * sizeof(float));
+//             float* cpu_k = malloc(kv_dim * sizeof(float));
+//             memcpy(cpu_q, s->q, dim * sizeof(float));
+//             memcpy(cpu_k, s->k, kv_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing RoPE...\n", l, pos);
+//             rope_encoding(dim, kv_dim, head_size, pos, cpu_q, cpu_k);
+//             rope_encoding_vx(dim, kv_dim, head_size, pos, s->q_vx, s->k_vx);
+//             compare_results("rope_q", cpu_q, s->q, dim);
+//             compare_results("rope_k", cpu_k, s->k, kv_dim);
+//             free(cpu_q); free(cpu_k);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             rope_encoding_vx(dim, kv_dim, head_size, pos, s->q_vx, s->k_vx);
+//             end_us = time_in_us();
+//             record_perf(pos_perf_data, OP_ROPE, start_us, end_us, NULL);
+//         } else {
+//             rope_encoding(dim, kv_dim, head_size, pos, s->q, s->k);
+//         }
+
+//         // Multihead attention
+//         if (g_enable_comparison) {
+//             float* cpu_xb = malloc(dim * sizeof(float));
+//             float* cpu_att = malloc(p->n_heads * p->seq_len * sizeof(float));
+//             memcpy(cpu_xb, s->xb, dim * sizeof(float));
+//             memcpy(cpu_att, s->att, p->n_heads * p->seq_len * sizeof(float));
+//             printf("[L%llu P%d] Comparing Multi-Head Attention...\n", l, pos);
+//             multihead_attention(cpu_xb, s->q, s->k, s->v, cpu_att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+//             multihead_attention_vx(s->xb_vx, s->q_vx, s->k_vx, s->v_vx, s->att_vx,
+//                              s->key_cache_vx, s->value_cache_vx, p->n_heads,
+//                              p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+//             compare_results("multihead_attention_xb", cpu_xb, s->xb, dim);
+//             free(cpu_xb);
+//             free(cpu_att);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             multihead_attention_vx(s->xb_vx, s->q_vx, s->k_vx, s->v_vx, s->att_vx,
+//                              s->key_cache_vx, s->value_cache_vx, p->n_heads,
+//                              p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+//             end_us = time_in_us();
+//             record_perf(pos_perf_data, OP_ATTENTION, start_us, end_us, NULL);
+//         } else {
+//             multihead_attention(s->xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+//         }
+
+//         // Final matmul (WO)
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (WO)...\n", l, pos);
+//             matmul(cpu_out, s->xb, w->wo + l*dim*dim, dim, dim);
+//             matmul_vx(s->xb2_vx, s->xb_vx, w->wo_vx + l * dim * dim * sizeof(float),
+//                 dim, dim);
+//             compare_results("matmul_wo", cpu_out, s->xb2, dim);
+//             free(cpu_out);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             matmul_vx(s->xb2_vx, s->xb_vx, w->wo_vx + l * dim * dim * sizeof(float),
+//                 dim, dim);
+//             end_us = time_in_us();
+//             snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, dim);
+//             record_perf(pos_perf_data, OP_MATMUL_WO, start_us, end_us, dim_str_buffer);
+//         } else {
+//             matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+//         }
+
+//         // Residual connection
+//         if (g_enable_comparison) {
+//             float* cpu_x = malloc(dim * sizeof(float));
+//             memcpy(cpu_x, x, dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing Accum (Attention)...\n", l, pos);
+//             accum(cpu_x, s->xb2, dim);
+//             accum_vx(x_vx, s->xb2_vx, dim);
+//             compare_results("accum_att", cpu_x, x, dim);
+//             free(cpu_x);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             accum_vx(x_vx, s->xb2_vx, dim);
+//             end_us = time_in_us();
+//             record_perf(pos_perf_data, OP_ACCUM_ATT, start_us, end_us, NULL);
+//         } else {
+//             accum(x, s->xb2, dim);
+//         }
+
+//         // FFN rmsnorm
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing RMSNorm (FFN)...\n", l, pos);
+//             rmsnorm(cpu_out, x, w->rms_ffn_weight + l*dim, dim);
+//             rmsnorm_vx(s->xb_vx, x_vx, w->rms_ffn_weight_vx + l * dim * sizeof(float),
+//                  dim);
+//             compare_results("rmsnorm_ffn", cpu_out, s->xb, dim);
+//             free(cpu_out);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             rmsnorm_vx(s->xb_vx, x_vx, w->rms_ffn_weight_vx + l * dim * sizeof(float),
+//                  dim);
+//             end_us = time_in_us();
+//             record_perf(pos_perf_data, OP_RMSNORM_FFN, start_us, end_us, NULL);
+//         } else {
+//             rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+//         }
+        
+//         // FFN matmuls (w1, w3)
+//         if (g_enable_comparison) {
+//             float* cpu_hb = malloc(hidden_dim * sizeof(float));
+//             float* cpu_hb2 = malloc(hidden_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (W1, W3)...\n", l, pos);
+//             matmul(cpu_hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+//             matmul_vx(s->hb_vx, s->xb_vx,
+//                 w->w1_vx + l * dim * hidden_dim * sizeof(float), dim,
+//                 hidden_dim);
+//             compare_results("matmul_w1", cpu_hb, s->hb, hidden_dim);
+//             matmul(cpu_hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+//             matmul_vx(s->hb2_vx, s->xb_vx,
+//                 w->w3_vx + l * dim * hidden_dim * sizeof(float), dim,
+//                 hidden_dim);
+//             compare_results("matmul_w3", cpu_hb2, s->hb2, hidden_dim);
+//             free(cpu_hb); free(cpu_hb2);
+//         } else if (g_enable_timing_analysis) {
+//             // Matmul W1
+//             start_us = time_in_us();
+//             matmul_vx(s->hb_vx, s->xb_vx,
+//                 w->w1_vx + l * dim * hidden_dim * sizeof(float), dim,
+//                 hidden_dim);
+//             end_us = time_in_us();
+//             snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, hidden_dim);
+//             record_perf(pos_perf_data, OP_MATMUL_W1, start_us, end_us, dim_str_buffer);
+
+//             // Matmul W3
+//             start_us = time_in_us();
+//             matmul_vx(s->hb2_vx, s->xb_vx,
+//                 w->w3_vx + l * dim * hidden_dim * sizeof(float), dim,
+//                 hidden_dim);
+//             end_us = time_in_us();
+//             snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, hidden_dim);
+//             record_perf(pos_perf_data, OP_MATMUL_W3, start_us, end_us, dim_str_buffer);
+//         } else {
+//             matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+//             matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+//         }
+
+//         // SwiGLU
+//         if (g_enable_comparison) {
+//             float* cpu_hb = malloc(hidden_dim * sizeof(float));
+//             memcpy(cpu_hb, s->hb, hidden_dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing SwiGLU...\n", l, pos);
+//             swiglu(cpu_hb, s->hb2, hidden_dim);
+//             swiglu_vx(s->hb_vx, s->hb2_vx, hidden_dim);
+//             compare_results("swiglu", cpu_hb, s->hb, hidden_dim);
+//             free(cpu_hb);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             swiglu_vx(s->hb_vx, s->hb2_vx, hidden_dim);
+//             end_us = time_in_us();
+//             record_perf(pos_perf_data, OP_SWIGLU, start_us, end_us, NULL);
+//         } else {
+//             swiglu(s->hb, s->hb2, hidden_dim);
+//         }
+
+//         // Final FFN matmul (W2)
+//         if (g_enable_comparison) {
+//             float* cpu_out = malloc(dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing MatMul (W2)...\n", l, pos);
+//             matmul(cpu_out, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+//             matmul_vx(s->xb_vx, s->hb_vx,
+//                 w->w2_vx + l * dim * hidden_dim * sizeof(float), hidden_dim,
+//                 dim);
+//             compare_results("matmul_w2", cpu_out, s->xb, dim);
+//             free(cpu_out);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             matmul_vx(s->xb_vx, s->hb_vx,
+//                 w->w2_vx + l * dim * hidden_dim * sizeof(float), hidden_dim,
+//                 dim);
+//             end_us = time_in_us();
+//             snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", hidden_dim, hidden_dim, dim);
+//             record_perf(pos_perf_data, OP_MATMUL_W2, start_us, end_us, dim_str_buffer);
+//         } else {
+//             matmul(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+//         }
+
+//         // Residual connection
+//         if (g_enable_comparison) {
+//             float* cpu_x = malloc(dim * sizeof(float));
+//             memcpy(cpu_x, x, dim * sizeof(float));
+//             printf("[L%llu P%d] Comparing Accum (FFN)...\n", l, pos);
+//             accum(cpu_x, s->xb, dim);
+//             accum_vx(x_vx, s->xb_vx, dim);
+//             compare_results("accum_ffn", cpu_x, x, dim);
+//             free(cpu_x);
+//         } else if (g_enable_timing_analysis) {
+//             start_us = time_in_us();
+//             accum_vx(x_vx, s->xb_vx, dim);
+//             end_us = time_in_us();
+//             record_perf(pos_perf_data, OP_ACCUM_FFN, start_us, end_us, NULL);
+//         } else {
+//             accum(x, s->xb, dim);
+//         }
+//     }
+
+//     // Final rmsnorm
+//     if (g_enable_comparison) {
+//         float* cpu_out = malloc(dim * sizeof(float));
+//         float* x_input_copy = malloc(dim * sizeof(float));
+//         memcpy(x_input_copy, x, dim * sizeof(float));
+//         printf("[P%d] Comparing RMSNorm (Final)...\n", pos);
+//         rmsnorm(cpu_out, x_input_copy, w->rms_final_weight, dim);
+
+//         rmsnorm_vx(x_vx, x_vx, w->rms_final_weight_vx, dim);
+
+//         compare_results("rmsnorm_final", cpu_out, x, dim);
+//         free(cpu_out);
+//         free(x_input_copy);
+//     } else if (g_enable_timing_analysis) {
+//         start_us = time_in_us();
+//         rmsnorm_vx(x_vx, x_vx, w->rms_final_weight_vx, dim);
+//         end_us = time_in_us();
+//         record_perf(pos_perf_data, OP_RMSNORM_FINAL, start_us, end_us, NULL);
+//     } else {
+//         rmsnorm(x, x, w->rms_final_weight, dim);
+//     }
+
+//     // Classifier into logits
+//     if (g_enable_comparison) {
+//         float* cpu_logits = malloc(p->vocab_size * sizeof(float));
+//         printf("[P%d] Comparing MatMul (Classifier)...\n", pos);
+//         matmul(cpu_logits, x, w->wcls, p->dim, p->vocab_size);
+
+//         matmul_vx(s->logits_vx, x_vx, w->wcls_vx, p->dim, p->vocab_size);
+
+//         compare_results("matmul_classifier", cpu_logits, s->logits, p->vocab_size);
+//         free(cpu_logits);
+//     } else if (g_enable_timing_analysis) {
+//         start_us = time_in_us();
+
+//         matmul_vx(s->logits_vx, x_vx, w->wcls_vx, p->dim, p->vocab_size);
+
+//         end_us = time_in_us();
+//         snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", p->dim, p->dim, p->vocab_size);
+//         record_perf(pos_perf_data, OP_MATMUL_CLS, start_us, end_us, dim_str_buffer);
+//     } else {
+//         matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+//     }
+
+//     // --- Print Performance Analysis Report ---
+//     if (g_enable_timing_analysis) {
+//         long long total_pos_time_us = 0;
+//         for (int i = 0; i < NUM_OPS; i++) {
+//             total_pos_time_us += pos_perf_data[i].total_time_us;
+//         }
+
+//         printf("\n\033[1;33m--- Timing Analysis for Position %d ---\033[0m\n", pos);
+//         printf("\033[1;33m----------------------------------------------------------------------------------------\033[0m\n");
+//         printf("\033[1;33m%-24s | %-24s | %12s | %s\033[0m\n", "Operator", "Dimensions", "Time (us)", "Percentage");
+//         printf("\033[1;33m----------------------------------------------------------------------------------------\033[0m\n");
+
+//         for (int i = 0; i < NUM_OPS; i++) {
+//             if (pos_perf_data[i].call_count > 0) {
+//                 double percentage = (total_pos_time_us > 0) ? ((double)pos_perf_data[i].total_time_us / total_pos_time_us * 100.0) : 0.0;
+//                 printf("%-24s | %-24s | %12lld | %9.2f%%\n",
+//                        op_names[i],
+//                        pos_perf_data[i].dim_info,
+//                        pos_perf_data[i].total_time_us,
+//                        percentage);
+//             }
+//         }
+//         printf("----------------------------------------------------------------------------------------\n");
+//         printf("\033[1;33m%-24s | %-24s | %12lld | %9.2f%%\033[0m\n", "Total Position Time", "", total_pos_time_us, 100.0);
+//         printf("\033[1;33m----------------------------------------------------------------------------------------\033[0m\n\n");
+//         fflush(stdout);
+//     }
+//     // --- End Report ---
+//     RT_CHECK(vx_copy_from_dev(s->logits, s->logits_vx_buf, 0,
+//                               p->vocab_size * sizeof(float)));
+//     RT_CHECK(vx_mem_free(x_buf));
+//     return s->logits;
+// }
 
 float* forward(Transformer* transformer, int token, int pos) {
-
     // a few convenience variables
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
@@ -829,68 +1128,85 @@ float* forward(Transformer* transformer, int token, int pos) {
     float* content_row = w->token_embedding_table + token * dim;
     memcpy(x, content_row, dim*sizeof(*x));
 
+    // If on a GPU path, upload the initial activation 'x' to the device
+    if (g_enable_comparison || g_enable_timing_analysis) {
+        RT_CHECK(vx_copy_to_dev(s->x_vx_buf, x, 0, dim * sizeof(float)));
+    }
+
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
+
+        int loff = l * p->seq_len * kv_dim;
 
         // Attention rmsnorm
         if (g_enable_comparison) {
             float* cpu_out = malloc(dim * sizeof(float));
+            float* gpu_out = malloc(dim * sizeof(float));
             printf("\n[L%llu P%d] Comparing RMSNorm (Attention)...\n", l, pos);
+
+            // CPU path
             rmsnorm(cpu_out, x, w->rms_att_weight + l*dim, dim);
-            rmsnorm_vx(s->xb, x, w->rms_att_weight + l*dim, dim);
-            compare_results("rmsnorm_att", cpu_out, s->xb, dim);
+
+            // GPU path
+            rmsnorm_vx(s->xb_vx, s->x_vx, w->rms_att_weight_vx + l*dim*sizeof(float), dim);
+            RT_CHECK(vx_copy_from_dev(gpu_out, s->xb_vx_buf, 0, dim*sizeof(float)));
+
+            compare_results("rmsnorm_att", cpu_out, gpu_out, dim);
+            memcpy(s->xb, cpu_out, dim * sizeof(float)); // Update host state for next op
+
             free(cpu_out);
+            free(gpu_out);
         } else if (g_enable_timing_analysis) {
             start_us = time_in_us();
-            rmsnorm_vx(s->xb, x, w->rms_att_weight + l*dim, dim);
+            rmsnorm_vx(s->xb_vx, s->x_vx, w->rms_att_weight_vx + l*dim*sizeof(float), dim);
             end_us = time_in_us();
             record_perf(pos_perf_data, OP_RMSNORM_ATT, start_us, end_us, NULL);
         } else {
             rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
         }
 
-        // key and value point to the kv cache
-        int loff = l * p->seq_len * kv_dim;
+        // key and value pointers/addresses for the kv cache
         s->k = s->key_cache + loff + pos * kv_dim;
         s->v = s->value_cache + loff + pos * kv_dim;
+        vx_addr_h k_vx_pos = s->key_cache_vx + (loff + pos * kv_dim) * sizeof(float);
+        vx_addr_h v_vx_pos = s->value_cache_vx + (loff + pos * kv_dim) * sizeof(float);
 
         // QKV matmuls for this position
         if (g_enable_comparison) {
-            float* cpu_q = malloc(dim * sizeof(float));
-            float* cpu_k = malloc(kv_dim * sizeof(float));
-            float* cpu_v = malloc(kv_dim * sizeof(float));
             printf("[L%llu P%d] Comparing MatMul (Q, K, V)...\n", l, pos);
-            matmul(cpu_q, s->xb, w->wq + l*dim*dim, dim, dim);
-            matmul_vx(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-            compare_results("matmul_q", cpu_q, s->q, dim);
-            matmul(cpu_k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-            matmul_vx(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-            compare_results("matmul_k", cpu_k, s->k, kv_dim);
-            matmul(cpu_v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
-            matmul_vx(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
-            compare_results("matmul_v", cpu_v, s->v, kv_dim);
-            free(cpu_q); free(cpu_k); free(cpu_v);
-        } else if (g_enable_timing_analysis) {
             // Matmul Q
-            start_us = time_in_us();
-            matmul_vx(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-            end_us = time_in_us();
-            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, dim);
-            record_perf(pos_perf_data, OP_MATMUL_Q, start_us, end_us, dim_str_buffer);
-            
+            float* cpu_q = malloc(dim*sizeof(float)); float* gpu_q = malloc(dim*sizeof(float));
+            matmul(cpu_q, s->xb, w->wq + l*dim*dim, dim, dim);
+            matmul_vx(s->q_vx, s->xb_vx, w->wq_vx + l*dim*dim*sizeof(float), dim, dim);
+            RT_CHECK(vx_copy_from_dev(gpu_q, s->q_vx_buf, 0, dim*sizeof(float)));
+            compare_results("matmul_q", cpu_q, gpu_q, dim);
+            memcpy(s->q, cpu_q, dim*sizeof(float));
+            free(cpu_q); free(gpu_q);
+
             // Matmul K
-            start_us = time_in_us();
-            matmul_vx(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-            end_us = time_in_us();
-            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, kv_dim);
-            record_perf(pos_perf_data, OP_MATMUL_K, start_us, end_us, dim_str_buffer);
-            
+            float* cpu_k = malloc(kv_dim*sizeof(float)); float* gpu_k = malloc(kv_dim*sizeof(float));
+            matmul(cpu_k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+            matmul_vx(k_vx_pos, s->xb_vx, w->wk_vx + l*dim*kv_dim*sizeof(float), dim, kv_dim);
+            RT_CHECK(vx_copy_from_dev(gpu_k, s->key_cache_vx_buf, (loff + pos * kv_dim) * sizeof(float), kv_dim*sizeof(float)));
+            compare_results("matmul_k", cpu_k, gpu_k, kv_dim);
+            memcpy(s->k, cpu_k, kv_dim*sizeof(float));
+            free(cpu_k); free(gpu_k);
+
             // Matmul V
-            start_us = time_in_us();
-            matmul_vx(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
-            end_us = time_in_us();
-            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, kv_dim);
-            record_perf(pos_perf_data, OP_MATMUL_V, start_us, end_us, dim_str_buffer);
+            float* cpu_v = malloc(kv_dim*sizeof(float)); float* gpu_v = malloc(kv_dim*sizeof(float));
+            matmul(cpu_v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+            matmul_vx(v_vx_pos, s->xb_vx, w->wv_vx + l*dim*kv_dim*sizeof(float), dim, kv_dim);
+            RT_CHECK(vx_copy_from_dev(gpu_v, s->value_cache_vx_buf, (loff + pos * kv_dim) * sizeof(float), kv_dim*sizeof(float)));
+            compare_results("matmul_v", cpu_v, gpu_v, kv_dim);
+            memcpy(s->v, cpu_v, kv_dim*sizeof(float));
+            free(cpu_v); free(gpu_v);
+        } else if (g_enable_timing_analysis) {
+            start_us = time_in_us(); matmul_vx(s->q_vx, s->xb_vx, w->wq_vx + l*dim*dim*sizeof(float), dim, dim); end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, dim); record_perf(pos_perf_data, OP_MATMUL_Q, start_us, end_us, dim_str_buffer);
+            start_us = time_in_us(); matmul_vx(k_vx_pos, s->xb_vx, w->wk_vx + l*dim*kv_dim*sizeof(float), dim, kv_dim); end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, kv_dim); record_perf(pos_perf_data, OP_MATMUL_K, start_us, end_us, dim_str_buffer);
+            start_us = time_in_us(); matmul_vx(v_vx_pos, s->xb_vx, w->wv_vx + l*dim*kv_dim*sizeof(float), dim, kv_dim); end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, kv_dim); record_perf(pos_perf_data, OP_MATMUL_V, start_us, end_us, dim_str_buffer);
         } else {
             matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
             matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
@@ -899,19 +1215,27 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // RoPE relative positional encoding
         if (g_enable_comparison) {
-            float* cpu_q = malloc(dim * sizeof(float));
-            float* cpu_k = malloc(kv_dim * sizeof(float));
-            memcpy(cpu_q, s->q, dim * sizeof(float));
-            memcpy(cpu_k, s->k, kv_dim * sizeof(float));
+            float* cpu_q = malloc(dim*sizeof(float)); memcpy(cpu_q, s->q, dim*sizeof(float));
+            float* cpu_k = malloc(kv_dim*sizeof(float)); memcpy(cpu_k, s->k, kv_dim*sizeof(float));
+            float* gpu_q = malloc(dim*sizeof(float)); float* gpu_k = malloc(kv_dim*sizeof(float));
             printf("[L%llu P%d] Comparing RoPE...\n", l, pos);
+
             rope_encoding(dim, kv_dim, head_size, pos, cpu_q, cpu_k);
-            rope_encoding_vx(dim, kv_dim, head_size, pos, s->q, s->k);
-            compare_results("rope_q", cpu_q, s->q, dim);
-            compare_results("rope_k", cpu_k, s->k, kv_dim);
-            free(cpu_q); free(cpu_k);
+            rope_encoding_vx(dim, kv_dim, head_size, pos, s->q_vx, k_vx_pos);
+
+            RT_CHECK(vx_copy_from_dev(gpu_q, s->q_vx_buf, 0, dim*sizeof(float)));
+            RT_CHECK(vx_copy_from_dev(gpu_k, s->key_cache_vx_buf, (loff + pos*kv_dim)*sizeof(float), kv_dim*sizeof(float)));
+            
+            compare_results("rope_q", cpu_q, gpu_q, dim);
+            compare_results("rope_k", cpu_k, gpu_k, kv_dim);
+
+            memcpy(s->q, cpu_q, dim*sizeof(float));
+            memcpy(s->k, cpu_k, kv_dim*sizeof(float));
+
+            free(cpu_q); free(cpu_k); free(gpu_q); free(gpu_k);
         } else if (g_enable_timing_analysis) {
             start_us = time_in_us();
-            rope_encoding_vx(dim, kv_dim, head_size, pos, s->q, s->k);
+            rope_encoding_vx(dim, kv_dim, head_size, pos, s->q_vx, k_vx_pos);
             end_us = time_in_us();
             record_perf(pos_perf_data, OP_ROPE, start_us, end_us, NULL);
         } else {
@@ -921,18 +1245,21 @@ float* forward(Transformer* transformer, int token, int pos) {
         // Multihead attention
         if (g_enable_comparison) {
             float* cpu_xb = malloc(dim * sizeof(float));
-            float* cpu_att = malloc(p->n_heads * p->seq_len * sizeof(float));
-            memcpy(cpu_xb, s->xb, dim * sizeof(float));
-            memcpy(cpu_att, s->att, p->n_heads * p->seq_len * sizeof(float));
+            float* gpu_xb = malloc(dim * sizeof(float));
             printf("[L%llu P%d] Comparing Multi-Head Attention...\n", l, pos);
-            multihead_attention(cpu_xb, s->q, s->k, s->v, cpu_att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
-            multihead_attention_vx(s->xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
-            compare_results("multihead_attention_xb", cpu_xb, s->xb, dim);
+            
+            multihead_attention(cpu_xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+            multihead_attention_vx(s->xb_vx, s->q_vx, 0, 0, s->att_vx, s->key_cache_vx, s->value_cache_vx, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+            RT_CHECK(vx_copy_from_dev(gpu_xb, s->xb_vx_buf, 0, dim*sizeof(float)));
+            
+            compare_results("multihead_attention_xb", cpu_xb, gpu_xb, dim);
+            memcpy(s->xb, cpu_xb, dim * sizeof(float));
+
             free(cpu_xb);
-            free(cpu_att);
+            free(gpu_xb);
         } else if (g_enable_timing_analysis) {
             start_us = time_in_us();
-            multihead_attention_vx(s->xb, s->q, s->k, s->v, s->att, s->key_cache, s->value_cache, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
+            multihead_attention_vx(s->xb_vx, s->q_vx, 0, 0, s->att_vx, s->key_cache_vx, s->value_cache_vx, p->n_heads, p->seq_len, head_size, kv_dim, kv_mul, pos, loff);
             end_us = time_in_us();
             record_perf(pos_perf_data, OP_ATTENTION, start_us, end_us, NULL);
         } else {
@@ -942,14 +1269,21 @@ float* forward(Transformer* transformer, int token, int pos) {
         // Final matmul (WO)
         if (g_enable_comparison) {
             float* cpu_out = malloc(dim * sizeof(float));
+            float* gpu_out = malloc(dim * sizeof(float));
             printf("[L%llu P%d] Comparing MatMul (WO)...\n", l, pos);
+
             matmul(cpu_out, s->xb, w->wo + l*dim*dim, dim, dim);
-            matmul_vx(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
-            compare_results("matmul_wo", cpu_out, s->xb2, dim);
+            matmul_vx(s->xb2_vx, s->xb_vx, w->wo_vx + l*dim*dim*sizeof(float), dim, dim);
+            RT_CHECK(vx_copy_from_dev(gpu_out, s->xb2_vx_buf, 0, dim * sizeof(float)));
+
+            compare_results("matmul_wo", cpu_out, gpu_out, dim);
+            memcpy(s->xb2, cpu_out, dim * sizeof(float));
+
             free(cpu_out);
+            free(gpu_out);
         } else if (g_enable_timing_analysis) {
             start_us = time_in_us();
-            matmul_vx(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+            matmul_vx(s->xb2_vx, s->xb_vx, w->wo_vx + l*dim*dim*sizeof(float), dim, dim);
             end_us = time_in_us();
             snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, dim);
             record_perf(pos_perf_data, OP_MATMUL_WO, start_us, end_us, dim_str_buffer);
@@ -959,16 +1293,21 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // Residual connection
         if (g_enable_comparison) {
-            float* cpu_x = malloc(dim * sizeof(float));
-            memcpy(cpu_x, x, dim * sizeof(float));
+            float* cpu_x = malloc(dim * sizeof(float)); memcpy(cpu_x, x, dim * sizeof(float));
+            float* gpu_x = malloc(dim * sizeof(float));
             printf("[L%llu P%d] Comparing Accum (Attention)...\n", l, pos);
+            
             accum(cpu_x, s->xb2, dim);
-            accum_vx(x, s->xb2, dim);
-            compare_results("accum_att", cpu_x, x, dim);
-            free(cpu_x);
+            accum_vx(s->x_vx, s->xb2_vx, dim);
+            RT_CHECK(vx_copy_from_dev(gpu_x, s->x_vx_buf, 0, dim * sizeof(float)));
+
+            compare_results("accum_att", cpu_x, gpu_x, dim);
+            memcpy(x, cpu_x, dim * sizeof(float));
+
+            free(cpu_x); free(gpu_x);
         } else if (g_enable_timing_analysis) {
             start_us = time_in_us();
-            accum_vx(x, s->xb2, dim);
+            accum_vx(s->x_vx, s->xb2_vx, dim);
             end_us = time_in_us();
             record_perf(pos_perf_data, OP_ACCUM_ATT, start_us, end_us, NULL);
         } else {
@@ -978,14 +1317,20 @@ float* forward(Transformer* transformer, int token, int pos) {
         // FFN rmsnorm
         if (g_enable_comparison) {
             float* cpu_out = malloc(dim * sizeof(float));
+            float* gpu_out = malloc(dim * sizeof(float));
             printf("[L%llu P%d] Comparing RMSNorm (FFN)...\n", l, pos);
+
             rmsnorm(cpu_out, x, w->rms_ffn_weight + l*dim, dim);
-            rmsnorm_vx(s->xb, x, w->rms_ffn_weight + l*dim, dim);
-            compare_results("rmsnorm_ffn", cpu_out, s->xb, dim);
-            free(cpu_out);
+            rmsnorm_vx(s->xb_vx, s->x_vx, w->rms_ffn_weight_vx + l*dim*sizeof(float), dim);
+            RT_CHECK(vx_copy_from_dev(gpu_out, s->xb_vx_buf, 0, dim * sizeof(float)));
+
+            compare_results("rmsnorm_ffn", cpu_out, gpu_out, dim);
+            memcpy(s->xb, cpu_out, dim * sizeof(float));
+
+            free(cpu_out); free(gpu_out);
         } else if (g_enable_timing_analysis) {
             start_us = time_in_us();
-            rmsnorm_vx(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+            rmsnorm_vx(s->xb_vx, s->x_vx, w->rms_ffn_weight_vx + l*dim*sizeof(float), dim);
             end_us = time_in_us();
             record_perf(pos_perf_data, OP_RMSNORM_FFN, start_us, end_us, NULL);
         } else {
@@ -994,30 +1339,29 @@ float* forward(Transformer* transformer, int token, int pos) {
         
         // FFN matmuls (w1, w3)
         if (g_enable_comparison) {
-            float* cpu_hb = malloc(hidden_dim * sizeof(float));
-            float* cpu_hb2 = malloc(hidden_dim * sizeof(float));
             printf("[L%llu P%d] Comparing MatMul (W1, W3)...\n", l, pos);
-            matmul(cpu_hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-            matmul_vx(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-            compare_results("matmul_w1", cpu_hb, s->hb, hidden_dim);
-            matmul(cpu_hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
-            matmul_vx(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
-            compare_results("matmul_w3", cpu_hb2, s->hb2, hidden_dim);
-            free(cpu_hb); free(cpu_hb2);
-        } else if (g_enable_timing_analysis) {
             // Matmul W1
-            start_us = time_in_us();
-            matmul_vx(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-            end_us = time_in_us();
-            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, hidden_dim);
-            record_perf(pos_perf_data, OP_MATMUL_W1, start_us, end_us, dim_str_buffer);
+            float* cpu_hb = malloc(hidden_dim * sizeof(float)); float* gpu_hb = malloc(hidden_dim * sizeof(float));
+            matmul(cpu_hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+            matmul_vx(s->hb_vx, s->xb_vx, w->w1_vx + l*dim*hidden_dim*sizeof(float), dim, hidden_dim);
+            RT_CHECK(vx_copy_from_dev(gpu_hb, s->hb_vx_buf, 0, hidden_dim * sizeof(float)));
+            compare_results("matmul_w1", cpu_hb, gpu_hb, hidden_dim);
+            memcpy(s->hb, cpu_hb, hidden_dim * sizeof(float));
+            free(cpu_hb); free(gpu_hb);
 
             // Matmul W3
-            start_us = time_in_us();
-            matmul_vx(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
-            end_us = time_in_us();
-            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, hidden_dim);
-            record_perf(pos_perf_data, OP_MATMUL_W3, start_us, end_us, dim_str_buffer);
+            float* cpu_hb2 = malloc(hidden_dim * sizeof(float)); float* gpu_hb2 = malloc(hidden_dim * sizeof(float));
+            matmul(cpu_hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+            matmul_vx(s->hb2_vx, s->xb_vx, w->w3_vx + l*dim*hidden_dim*sizeof(float), dim, hidden_dim);
+            RT_CHECK(vx_copy_from_dev(gpu_hb2, s->hb2_vx_buf, 0, hidden_dim * sizeof(float)));
+            compare_results("matmul_w3", cpu_hb2, gpu_hb2, hidden_dim);
+            memcpy(s->hb2, cpu_hb2, hidden_dim * sizeof(float));
+            free(cpu_hb2); free(gpu_hb2);
+        } else if (g_enable_timing_analysis) {
+            start_us = time_in_us(); matmul_vx(s->hb_vx, s->xb_vx, w->w1_vx + l*dim*hidden_dim*sizeof(float), dim, hidden_dim); end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, hidden_dim); record_perf(pos_perf_data, OP_MATMUL_W1, start_us, end_us, dim_str_buffer);
+            start_us = time_in_us(); matmul_vx(s->hb2_vx, s->xb_vx, w->w3_vx + l*dim*hidden_dim*sizeof(float), dim, hidden_dim); end_us = time_in_us();
+            snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", dim, dim, hidden_dim); record_perf(pos_perf_data, OP_MATMUL_W3, start_us, end_us, dim_str_buffer);
         } else {
             matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
             matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
@@ -1025,16 +1369,21 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // SwiGLU
         if (g_enable_comparison) {
-            float* cpu_hb = malloc(hidden_dim * sizeof(float));
-            memcpy(cpu_hb, s->hb, hidden_dim * sizeof(float));
+            float* cpu_hb = malloc(hidden_dim * sizeof(float)); memcpy(cpu_hb, s->hb, hidden_dim * sizeof(float));
+            float* gpu_hb = malloc(hidden_dim * sizeof(float));
             printf("[L%llu P%d] Comparing SwiGLU...\n", l, pos);
+
             swiglu(cpu_hb, s->hb2, hidden_dim);
-            swiglu_vx(s->hb, s->hb2, hidden_dim);
-            compare_results("swiglu", cpu_hb, s->hb, hidden_dim);
-            free(cpu_hb);
+            swiglu_vx(s->hb_vx, s->hb2_vx, hidden_dim);
+            RT_CHECK(vx_copy_from_dev(gpu_hb, s->hb_vx_buf, 0, hidden_dim * sizeof(float)));
+
+            compare_results("swiglu", cpu_hb, gpu_hb, hidden_dim);
+            memcpy(s->hb, cpu_hb, hidden_dim * sizeof(float));
+            
+            free(cpu_hb); free(gpu_hb);
         } else if (g_enable_timing_analysis) {
             start_us = time_in_us();
-            swiglu_vx(s->hb, s->hb2, hidden_dim);
+            swiglu_vx(s->hb_vx, s->hb2_vx, hidden_dim);
             end_us = time_in_us();
             record_perf(pos_perf_data, OP_SWIGLU, start_us, end_us, NULL);
         } else {
@@ -1044,14 +1393,20 @@ float* forward(Transformer* transformer, int token, int pos) {
         // Final FFN matmul (W2)
         if (g_enable_comparison) {
             float* cpu_out = malloc(dim * sizeof(float));
+            float* gpu_out = malloc(dim * sizeof(float));
             printf("[L%llu P%d] Comparing MatMul (W2)...\n", l, pos);
+
             matmul(cpu_out, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
-            matmul_vx(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
-            compare_results("matmul_w2", cpu_out, s->xb, dim);
-            free(cpu_out);
+            matmul_vx(s->xb_vx, s->hb_vx, w->w2_vx + l*hidden_dim*dim*sizeof(float), hidden_dim, dim);
+            RT_CHECK(vx_copy_from_dev(gpu_out, s->xb_vx_buf, 0, dim * sizeof(float)));
+
+            compare_results("matmul_w2", cpu_out, gpu_out, dim);
+            memcpy(s->xb, cpu_out, dim * sizeof(float));
+
+            free(cpu_out); free(gpu_out);
         } else if (g_enable_timing_analysis) {
             start_us = time_in_us();
-            matmul_vx(s->xb, s->hb, w->w2 + l*hidden_dim*dim, hidden_dim, dim);
+            matmul_vx(s->xb_vx, s->hb_vx, w->w2_vx + l*hidden_dim*dim*sizeof(float), hidden_dim, dim);
             end_us = time_in_us();
             snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", hidden_dim, hidden_dim, dim);
             record_perf(pos_perf_data, OP_MATMUL_W2, start_us, end_us, dim_str_buffer);
@@ -1061,16 +1416,21 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // Residual connection
         if (g_enable_comparison) {
-            float* cpu_x = malloc(dim * sizeof(float));
-            memcpy(cpu_x, x, dim * sizeof(float));
+            float* cpu_x = malloc(dim * sizeof(float)); memcpy(cpu_x, x, dim * sizeof(float));
+            float* gpu_x = malloc(dim * sizeof(float));
             printf("[L%llu P%d] Comparing Accum (FFN)...\n", l, pos);
+
             accum(cpu_x, s->xb, dim);
-            accum_vx(x, s->xb, dim);
-            compare_results("accum_ffn", cpu_x, x, dim);
-            free(cpu_x);
+            accum_vx(s->x_vx, s->xb_vx, dim);
+            RT_CHECK(vx_copy_from_dev(gpu_x, s->x_vx_buf, 0, dim * sizeof(float)));
+            
+            compare_results("accum_ffn", cpu_x, gpu_x, dim);
+            memcpy(x, cpu_x, dim * sizeof(float));
+
+            free(cpu_x); free(gpu_x);
         } else if (g_enable_timing_analysis) {
             start_us = time_in_us();
-            accum_vx(x, s->xb, dim);
+            accum_vx(s->x_vx, s->xb_vx, dim);
             end_us = time_in_us();
             record_perf(pos_perf_data, OP_ACCUM_FFN, start_us, end_us, NULL);
         } else {
@@ -1080,18 +1440,21 @@ float* forward(Transformer* transformer, int token, int pos) {
 
     // Final rmsnorm
     if (g_enable_comparison) {
-        float* cpu_out = malloc(dim * sizeof(float));
-        float* x_input_copy = malloc(dim * sizeof(float));
-        memcpy(x_input_copy, x, dim * sizeof(float));
+        float* cpu_out = malloc(dim * sizeof(float)); memcpy(cpu_out, x, dim * sizeof(float));
+        float* gpu_out = malloc(dim * sizeof(float));
         printf("[P%d] Comparing RMSNorm (Final)...\n", pos);
-        rmsnorm(cpu_out, x_input_copy, w->rms_final_weight, dim);
-        rmsnorm_vx(x, x_input_copy, w->rms_final_weight, dim);
-        compare_results("rmsnorm_final", cpu_out, x, dim);
-        free(cpu_out);
-        free(x_input_copy);
+
+        rmsnorm(cpu_out, cpu_out, w->rms_final_weight, dim); // In-place on cpu_out
+        rmsnorm_vx(s->x_vx, s->x_vx, w->rms_final_weight_vx, dim);
+        RT_CHECK(vx_copy_from_dev(gpu_out, s->x_vx_buf, 0, dim * sizeof(float)));
+
+        compare_results("rmsnorm_final", cpu_out, gpu_out, dim);
+        memcpy(x, cpu_out, dim * sizeof(float));
+
+        free(cpu_out); free(gpu_out);
     } else if (g_enable_timing_analysis) {
         start_us = time_in_us();
-        rmsnorm_vx(x, x, w->rms_final_weight, dim);
+        rmsnorm_vx(s->x_vx, s->x_vx, w->rms_final_weight_vx, dim);
         end_us = time_in_us();
         record_perf(pos_perf_data, OP_RMSNORM_FINAL, start_us, end_us, NULL);
     } else {
@@ -1101,19 +1464,30 @@ float* forward(Transformer* transformer, int token, int pos) {
     // Classifier into logits
     if (g_enable_comparison) {
         float* cpu_logits = malloc(p->vocab_size * sizeof(float));
+        float* gpu_logits = malloc(p->vocab_size * sizeof(float));
         printf("[P%d] Comparing MatMul (Classifier)...\n", pos);
+
         matmul(cpu_logits, x, w->wcls, p->dim, p->vocab_size);
-        matmul_vx(s->logits, x, w->wcls, p->dim, p->vocab_size);
-        compare_results("matmul_classifier", cpu_logits, s->logits, p->vocab_size);
-        free(cpu_logits);
+        matmul_vx(s->logits_vx, s->x_vx, w->wcls_vx, p->dim, p->vocab_size);
+        RT_CHECK(vx_copy_from_dev(gpu_logits, s->logits_vx_buf, 0, p->vocab_size * sizeof(float)));
+
+        compare_results("matmul_classifier", cpu_logits, gpu_logits, p->vocab_size);
+        memcpy(s->logits, cpu_logits, p->vocab_size * sizeof(float));
+
+        free(cpu_logits); free(gpu_logits);
     } else if (g_enable_timing_analysis) {
         start_us = time_in_us();
-        matmul_vx(s->logits, x, w->wcls, p->dim, p->vocab_size);
+        matmul_vx(s->logits_vx, s->x_vx, w->wcls_vx, p->dim, p->vocab_size);
         end_us = time_in_us();
         snprintf(dim_str_buffer, sizeof(dim_str_buffer), "[1, %d] x [%d, %d]", p->dim, p->dim, p->vocab_size);
         record_perf(pos_perf_data, OP_MATMUL_CLS, start_us, end_us, dim_str_buffer);
     } else {
         matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    }
+
+    // For GPU paths, download the final logits to the host buffer
+    if (g_enable_timing_analysis) {
+        RT_CHECK(vx_copy_from_dev(s->logits, s->logits_vx_buf, 0, p->vocab_size * sizeof(float)));
     }
 
     // --- Print Performance Analysis Report ---
@@ -1573,7 +1947,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
         // init the timer here because the first iteration can be slower
         if (start == 0) { start = time_in_ms(); }
-        //TODO: 这里用于对比，指打印一个pos的生成结果，所以直接退出
+        //TODO: 这里用于对比，仅打印1个pos的生成结果，所以直接退出
         break;
     }
     
