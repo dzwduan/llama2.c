@@ -93,6 +93,7 @@ clean:
 	rm -f runq
 	rm -rf trace
 	rm -rf kernel/build
+	rm -rf *.log
 
 
 .PHONY: build_kernels
@@ -122,3 +123,8 @@ else
 	@echo "\033[1;31m====== ERROR: Unknown MODE=$(MODE). Valid values: DEBUG, PERF =======\033[0m"
 	@exit 1
 endif
+
+.PHONY: calc-vmem
+calc-vmem:
+	gcc valc_vmem.c -o valc_vmem -lm
+	./valc_vmem
